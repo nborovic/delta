@@ -1,0 +1,18 @@
+[package]
+name = "delta-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = "1.8.7"
+bytes = "1.12.1"
+futures = "0.3.34"
+moka = { version = "0.12.16", features = ["future"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"

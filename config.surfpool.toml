@@ -1,0 +1,88 @@
+# Three local, offline Surfpool simnets as upstreams: real HTTP and WebSocket
+# endpoints, no network access. Each Surfpool instance is its own chain, so
+# their state differs after a write lands on only some of them, which is what
+# makes quorum interesting.
+#
+#   surfpool start --offline --no-studio --no-tui -y -p 8899 -w 8900      # terminal 1
+#   surfpool start --offline --no-studio --no-tui -y -p 8999 -w 9000      # terminal 2
+#   surfpool start --offline --no-studio --no-tui -y -p 9099 -w 9100      # terminal 3
+#   cargo run --bin delta -- config.surfpool.toml
+#   scripts/smoke.sh
+
+# delta answers on 8080 and 8081, both HTTP and WebSocket: Solana clients look
+# for the WebSocket on the RPC port + 1.
+listen = "127.0.0.1:8080"
+
+# Every request needs an API key: ?api-key=<key>. These are for local
+# development only; generate your own with `uuidgen`, and keep real keys in
+# the environment (key = "${DELTA_KEY}").
+[apiKeys.local]
+key = "11111111-2222-4333-8444-555555555555"
+routes = ["*"]
+
+# Only /rpc/cache, at most 5 requests per second.
+[apiKeys.limited]
+key = "22222222-3333-4444-8555-666666666666"
+routes = ["cache"]
+rps = 5
+
+[upstreams]
+surf-a = { http = "http://127.0.0.1:8899", ws = "ws://127.0.0.1:8900" }
+surf-b = { http = "http://127.0.0.1:8999", ws = "ws://127.0.0.1:9000" }
+surf-c = { http = "http://127.0.0.1:9099", ws = "ws://127.0.0.1:9100" }
+
+# /rpc/hedge: every method, raced on two of the three nodes; the first answer
+# wins. A write goes to both, and never reaches surf-c.
+[routes.hedge]
+upstreams = ["surf-a", "surf-b"]
+hedge = { upstreams = 2 }
+
+[routes.hedge.methods]
+"*" = {}
+
+# /rpc/safe: all three nodes are asked; an answer needs two that agree.
+[routes.safe]
+upstreams = ["*"]
+quorum = { threshold = 2, upstreams = 3 }
+
+[routes.safe.methods]
+getBalance     = {}
+getAccountInfo = {}
+
+# /rpc/cache: getLatestBlockhash only, cached for 5 s per node, with requests
+# spread 3:2:1 over the nodes.
+[routes.cache]
+upstreams = ["*"]
+cache = { ttl = 5000 }
+loadBalancing = { type = "weighted", weights = { surf-a = 3, surf-b = 2, surf-c = 1 } }
+
+[routes.cache.methods]
+getLatestBlockhash = {}
+
+# /rpc/failover: every method on surf-a while it is healthy, then surf-b, then
+# surf-c. One node at a time, so a wallet or the Solana CLI sees one
+# consistent chain. Stop surf-a and watch requests move on: five failed calls
+# mark it unhealthy, and the retries carry the request that trips it over to
+# surf-b.
+[routes.failover]
+upstreams = ["*"]
+loadBalancing = { type = "priority", order = ["surf-a", "surf-b", "surf-c"] }
+retry = { attempts = 5, delay = 50 }
+
+[routes.failover.methods]
+"*" = {}
+
+# /rpc/stream: subscriptions opened on all three nodes, each notification
+# forwarded once.
+[routes.stream]
+upstreams = ["*"]
+
+[routes.stream.methods]
+slotSubscribe        = {}
+slotUnsubscribe      = {}
+accountSubscribe     = {}
+accountUnsubscribe   = {}
+signatureSubscribe   = {}
+signatureUnsubscribe = {}
+logsSubscribe        = {}
+logsUnsubscribe      = {}

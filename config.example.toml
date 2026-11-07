@@ -1,0 +1,91 @@
+listen = "0.0.0.0:8080"
+
+[stores.moka]
+maxSizeMb = 2048
+
+[apiKeys.backend]
+key = "${BACKEND_KEY}"
+rps = 500
+routes = ["*"]
+
+[apiKeys.dashboard]
+key = "3f8a2c1e-7b4d-4e9a-b6c2-1d5e8f0a9b37"
+rps = 20
+allowedDomains = ["app.example.com", "*.example.com"]
+routes = ["fast", "stream"]
+
+[apiKeys.indexer]
+key = "${INDEXER_KEY}"
+allowedIps = ["10.0.0.0/8"]
+routes = ["indexer"]
+
+[upstreams]
+helius = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}"
+triton = "https://xyz.mainnet.rpcpool.com/${TRITON_TOKEN}"
+own-1  = { http = "http://10.0.0.11:8899", ws = "ws://10.0.0.11:8900" }
+own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
+
+# /fast: race providers for low-latency reads
+[routes.fast]
+upstreams = ["helius", "triton", "own-*"]
+cache = { ttl = 200 }
+hedge = { upstreams = 2 }
+
+[routes.fast.methods]
+getLatestBlockhash  = { cache = { ttl = 0 } }
+getAccountInfo      = {}
+getBalance          = {}
+getMultipleAccounts = {}
+
+# /safe: reads verified by quorum, cache shared with other verified routes
+[routes.safe]
+upstreams = ["*"]
+cache = { namespace = "verified", ttl = 1000 }
+quorum = { threshold = 2, upstreams = 3 }
+
+[routes.safe.methods]
+"*"                 = {}
+sendTransaction     = false
+requestAirdrop      = false
+sendBundle          = false
+simulateTransaction = false
+getBlock            = { cache = { ttl = 86400000 }, loadBalancing = { type = "priority", order = ["own-*", "helius"] } }
+getTransaction      = { cache = { ttl = 86400000 } }
+getLatestBlockhash  = { cache = { ttl = 0 }, quorum = false, hedge = { upstreams = 2 } }
+getSlot             = { cache = { ttl = 0 }, quorum = false, retry = { attempts = 3, delay = 50 } }
+getProgramAccounts  = { cache = { ttl = 0 }, quorum = false, retry = { attempts = 3, delay = 50 } }
+
+# /indexer: history from own nodes, paid provider as fallback
+[routes.indexer]
+upstreams = ["own-1", "own-2", "helius"]
+loadBalancing = { type = "priority", order = ["own-1", "own-2", "helius"] }
+cache = { ttl = 86400000 }
+retry = { attempts = 5, delay = 200 }
+
+[routes.indexer.methods]
+getBlock                = {}
+getTransaction          = {}
+getSignaturesForAddress = { cache = { ttl = 0 } }
+getSlot                 = { cache = { ttl = 0 } }
+
+# /send: transactions to 4 upstreams
+[routes.send]
+upstreams = ["*"]
+hedge = { upstreams = 4 }
+
+[routes.send.methods]
+sendTransaction = {}
+
+# /stream: subscriptions on two upstreams
+[routes.stream]
+upstreams = ["helius", "own-1"]
+
+[routes.stream.methods]
+accountSubscribe     = {}
+accountUnsubscribe   = {}
+slotSubscribe        = {}
+slotUnsubscribe      = {}
+logsSubscribe        = {}
+logsUnsubscribe      = {}
+signatureSubscribe   = {}
+signatureUnsubscribe = {}
