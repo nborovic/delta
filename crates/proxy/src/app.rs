@@ -144,7 +144,7 @@ impl Body {
         }
     }
 
-    /// Requests this body counts against `rps`.
+    /// Requests this body counts against `totalRps` and `rpmPerIp`.
     pub fn count(&self) -> u32 {
         match self {
             Body::Single(_) => 1,

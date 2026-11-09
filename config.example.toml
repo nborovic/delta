@@ -5,12 +5,14 @@ maxSizeMb = 2048
 
 [apiKeys.backend]
 key = "${BACKEND_KEY}"
-rps = 500
+totalRps = 500
 routes = ["*"]
 
 [apiKeys.dashboard]
 key = "3f8a2c1e-7b4d-4e9a-b6c2-1d5e8f0a9b37"
-rps = 20
+totalRps = 20
+rpsPerIp = 5                          # each browser user: bursts
+rpmPerIp = 120                        # ...and the minute
 allowedDomains = ["app.example.com", "*.example.com"]
 routes = ["fast", "stream"]
 

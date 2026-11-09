@@ -183,7 +183,7 @@ pub async fn handle(app: Arc<App>, mut req: Request<Incoming>, peer: SocketAddr)
         }
     };
     let body = Body::parse(&bytes);
-    if !app.auth.take(key, body.count()) {
+    if !app.auth.take(key, ip, body.count()) {
         refused(&key_name, 429, "rate limited");
         return json(StatusCode::TOO_MANY_REQUESTS, Answer::error(jsonrpc::RATE_LIMITED, "rate limited").to_response(&null_id()));
     }

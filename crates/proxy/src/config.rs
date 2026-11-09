@@ -84,7 +84,12 @@ impl Moka {
 pub struct ApiKey {
     /// A UUID, literal or `${VAR}`; parsed after expansion.
     pub key: String,
-    pub rps: Option<u32>,
+    /// Requests per second for the key, from every IP together.
+    pub total_rps: Option<u32>,
+    /// Requests per second from each client IP (IPv6: each /64): caps bursts.
+    pub rps_per_ip: Option<u32>,
+    /// Requests per minute from each client IP (IPv6: each /64).
+    pub rpm_per_ip: Option<u32>,
     /// IPs or CIDR ranges.
     pub allowed_ips: Option<Vec<String>>,
     /// `app.example.com` or `*.example.com`.
@@ -97,10 +102,18 @@ pub struct ApiKey {
 
 impl ApiKey {
     pub fn new(key: impl Into<String>) -> Self {
-        ApiKey { key: key.into(), rps: None, allowed_ips: None, allowed_domains: None, routes: Vec::new(), max_subscriptions: None }
+        ApiKey { key: key.into(), total_rps: None, rps_per_ip: None, rpm_per_ip: None, allowed_ips: None, allowed_domains: None, routes: Vec::new(), max_subscriptions: None }
     }
-    pub fn rps(mut self, rps: u32) -> Self {
-        self.rps = Some(rps);
+    pub fn total_rps(mut self, n: u32) -> Self {
+        self.total_rps = Some(n);
+        self
+    }
+    pub fn rps_per_ip(mut self, n: u32) -> Self {
+        self.rps_per_ip = Some(n);
+        self
+    }
+    pub fn rpm_per_ip(mut self, n: u32) -> Self {
+        self.rpm_per_ip = Some(n);
         self
     }
     pub fn allowed_ips<I: IntoIterator<Item = S>, S: Into<String>>(mut self, ips: I) -> Self {

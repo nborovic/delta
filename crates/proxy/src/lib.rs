@@ -13,7 +13,7 @@
 //!         .listen("0.0.0.0:8080")
 //!         .moka(Moka::max_size_mb(2048))
 //!         .upstream("helius", Upstream::url(format!("https://mainnet.helius-rpc.com/?api-key={}", env("HELIUS_KEY")?)))
-//!         .api_key("backend", ApiKey::new(env("BACKEND_KEY")?).rps(500).routes(["*"]))
+//!         .api_key("backend", ApiKey::new(env("BACKEND_KEY")?).total_rps(500).routes(["*"]))
 //!         .route("fast", Route::new(["helius"])
 //!             .load_balancing(LoadBalancing::RoundRobin).cache(Cache::ttl(200)).hedge(Hedge::upstreams(1))
 //!             .method("getAccountInfo", Policies::new()))

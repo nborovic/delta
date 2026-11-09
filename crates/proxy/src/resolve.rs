@@ -82,7 +82,9 @@ impl RouteTable {
 pub struct KeySpec {
     pub name: String,
     pub key: Uuid,
-    pub rps: Option<u32>,
+    pub total_rps: Option<u32>,
+    pub rps_per_ip: Option<u32>,
+    pub rpm_per_ip: Option<u32>,
     pub allowed_ips: Option<Vec<IpNet>>,
     pub allowed_domains: Option<Vec<String>>,
     pub routes: Vec<Glob>,
@@ -151,7 +153,7 @@ pub fn resolve(config: &Config) -> Result<Resolved, ConfigError> {
         errors.push("routes: at least one route is required".into());
     }
 
-    let api_keys = resolve_keys(&config.api_keys, &config.routes, &mut errors);
+    let api_keys = resolve_keys(&config.api_keys, &config.routes, &mut errors, &mut warnings);
     if config.api_keys.is_empty() {
         errors.push(
             "apiKeys: at least one API key is required; every request must carry one as ?api-key=<uuid> \
@@ -672,7 +674,12 @@ fn warn_unused_policies(path: &str, route: &Route, warnings: &mut Vec<String>) {
     }
 }
 
-fn resolve_keys(keys: &BTreeMap<String, ApiKey>, routes: &BTreeMap<String, Route>, errors: &mut Vec<String>) -> Vec<KeySpec> {
+fn resolve_keys(
+    keys: &BTreeMap<String, ApiKey>,
+    routes: &BTreeMap<String, Route>,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Vec<KeySpec> {
     let mut out = Vec::new();
     let mut seen: HashMap<Uuid, &str> = HashMap::new();
     for (name, k) in keys {
@@ -728,8 +735,22 @@ fn resolve_keys(keys: &BTreeMap<String, ApiKey>, routes: &BTreeMap<String, Route
                 })
                 .collect()
         });
-        if k.rps == Some(0) {
-            errors.push(format!("{path}.rps: must be at least 1 (leave it out for unlimited)"));
+        if k.total_rps == Some(0) {
+            errors.push(format!("{path}.totalRps: must be at least 1 (leave it out for unlimited)"));
+        }
+        if k.rps_per_ip == Some(0) {
+            errors.push(format!("{path}.rpsPerIp: must be at least 1 (leave it out for unlimited)"));
+        }
+        if k.rpm_per_ip == Some(0) {
+            errors.push(format!("{path}.rpmPerIp: must be at least 1 (leave it out for unlimited)"));
+        }
+        if let (Some(rps), Some(rpm)) = (k.rps_per_ip, k.rpm_per_ip) {
+            if u64::from(rpm) >= u64::from(rps) * 60 {
+                warnings.push(format!(
+                    "{path}.rpmPerIp: {rpm} hardly limits anything: rpsPerIp = {rps} already allows only about {} a minute",
+                    u64::from(rps) * 60
+                ));
+            }
         }
         if k.max_subscriptions == Some(0) {
             errors.push(format!("{path}.maxSubscriptions: must be at least 1 (leave it out for unlimited)"));
@@ -738,7 +759,9 @@ fn resolve_keys(keys: &BTreeMap<String, ApiKey>, routes: &BTreeMap<String, Route
             out.push(KeySpec {
                 name: name.clone(),
                 key,
-                rps: k.rps,
+                total_rps: k.total_rps,
+                rps_per_ip: k.rps_per_ip,
+                rpm_per_ip: k.rpm_per_ip,
                 allowed_ips,
                 allowed_domains,
                 routes: globs,
@@ -918,6 +941,15 @@ getSlot = { retry = { attempts = 5 } }
         assert!(e.contains("`fsat` is not a defined route"), "{e}");
         let ok = load(&format!("{route}[apiKeys.a]\nkey = \"{k}\"\nroutes = [\"f*\"]\nallowedIps = [\"10.0.0.0/8\", \"1.2.3.4\"]\n")).unwrap();
         assert_eq!(ok.api_keys[0].allowed_ips.as_ref().unwrap().len(), 2);
+        let limits = |l: &str| format!("{route}[apiKeys.a]\nkey = \"{k}\"\nroutes = [\"*\"]\n{l}\n");
+        for field in ["totalRps", "rpsPerIp", "rpmPerIp"] {
+            assert!(err(&limits(&format!("{field} = 0"))).contains(&format!("apiKeys.a.{field}: must be at least 1")), "{field}");
+        }
+        let ok = load(&limits("totalRps = 100\nrpsPerIp = 5\nrpmPerIp = 120")).unwrap();
+        assert_eq!((ok.api_keys[0].total_rps, ok.api_keys[0].rps_per_ip, ok.api_keys[0].rpm_per_ip), (Some(100), Some(5), Some(120)));
+        assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+        let loose = load(&limits("rpsPerIp = 5\nrpmPerIp = 300")).unwrap();
+        assert!(loose.warnings.iter().any(|w| w.contains("apiKeys.a.rpmPerIp: 300 hardly limits anything: rpsPerIp = 5 already allows only about 300 a minute")), "{:?}", loose.warnings);
     }
 
     #[test]

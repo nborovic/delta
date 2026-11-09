@@ -115,7 +115,7 @@ pub async fn serve(app: Arc<App>, ws: HyperWebsocket, route: Option<Arc<RouteTab
         let arrived = Instant::now();
         messages += 1;
         let body = Body::parse(text.as_bytes());
-        if !app.auth.take(key, body.count()) {
+        if !app.auth.take(key, who.ip, body.count()) {
             log_refused(&who.via, &who.key, who.ip, &format!("/rpc/{}", who.route), 429, "rate limited");
             // No HTTP status over an open WebSocket: the message's response
             // carries the error.

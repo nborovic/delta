@@ -88,8 +88,14 @@ fn generate(text: &str, source_name: &str) -> Result<(String, BTreeSet<String>),
     }
     for (name, k) in &raw.api_keys {
         let mut key = format!("ApiKey::new({})", g.expr(&k.key).code);
-        if let Some(rps) = k.rps {
-            write!(key, ".rps({rps})").unwrap();
+        if let Some(n) = k.total_rps {
+            write!(key, ".total_rps({n})").unwrap();
+        }
+        if let Some(n) = k.rps_per_ip {
+            write!(key, ".rps_per_ip({n})").unwrap();
+        }
+        if let Some(n) = k.rpm_per_ip {
+            write!(key, ".rpm_per_ip({n})").unwrap();
         }
         if let Some(ips) = &k.allowed_ips {
             write!(key, ".allowed_ips({})", g.list(ips)).unwrap();
@@ -435,7 +441,8 @@ mod tests {
         for expected in [
             ".upstream(\"helius\", Upstream::url(format!(\"https://mainnet.helius-rpc.com/?api-key={}\", env(\"HELIUS_KEY\")?)))",
             ".upstream(\"own-1\", Upstream::split(\"http://10.0.0.11:8899\", \"ws://10.0.0.11:8900\"))",
-            ".api_key(\"backend\", ApiKey::new(env(\"BACKEND_KEY\")?).rps(500).routes([\"*\"]))",
+            ".api_key(\"backend\", ApiKey::new(env(\"BACKEND_KEY\")?).total_rps(500).routes([\"*\"]))",
+            "ApiKey::new(\"3f8a2c1e-7b4d-4e9a-b6c2-1d5e8f0a9b37\").total_rps(20).rps_per_ip(5).rpm_per_ip(120)",
             ".reject(\"sendTransaction\")",
             ".method(\"getSlot\", Policies::new().cache(Cache::ttl(0)).retry(Retry::new(3, 50)).no_quorum())",
             "LoadBalancing::priority([\"own-*\", \"helius\"])",

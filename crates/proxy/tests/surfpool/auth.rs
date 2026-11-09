@@ -1,4 +1,4 @@
-//! API keys: key check, routes per key, rps, allowed IPs and domains, over
+//! API keys: key check, routes per key, rate limits, allowed IPs and domains, over
 //! HTTP and WebSocket.
 
 use serde_json::{json, Value};
@@ -10,6 +10,7 @@ const K2: &str = "6a1f0c2e-8a3b-4c5d-9e7f-0123456789ab";
 const K3: &str = "7b2e1d3f-9b4c-4d6e-8f01-123456789abc";
 const K4: &str = "8c3f2e40-ac5d-4e7f-9012-23456789abcd";
 const K5: &str = "9d4a3f51-bd6e-4f80-8123-3456789abcde";
+const K6: &str = "ae5b4062-ce7f-4091-9234-456789abcdef";
 
 /// The proxy's peer in these tests is 127.0.0.1: trusting it makes
 /// `X-Forwarded-For` count, as behind a real load balancer.
@@ -36,7 +37,7 @@ upstreams = ["*"]
 [apiKeys.backend]
 key = "{K1}"
 routes = ["fast", "str*"]
-rps = 5
+totalRps = 5
 
 [apiKeys.office]
 key = "{K2}"
@@ -46,7 +47,13 @@ allowedIps = ["10.0.0.0/8", "192.168.1.7"]
 [apiKeys.second]
 key = "{K4}"
 routes = ["*"]
-rps = 5
+totalRps = 5
+
+[apiKeys.public]
+key = "{K6}"
+routes = ["fast"]
+rpmPerIp = 2
+totalRps = 3
 
 [apiKeys.watcher]
 key = "{K5}"
@@ -124,6 +131,30 @@ async fn one_budget_per_key_across_routes_and_transports() {
     let mut ws = Ws::connect(&format!("{}?api-key={K1}", env.ws_url("stream"))).await;
     assert_eq!(code(&ws.call("getLatestBlockhash", json!(null)).await), -33092, "a WebSocket, same budget");
     assert_eq!(post(&env, &format!("/rpc/fast?api-key={K4}"), &[]).await.0, 200, "another limited key has its own");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn rpm_per_ip_limits_each_client_and_total_rps_all_of_them() {
+    let env = env_top(&[0], BEHIND_LB, &config()).await;
+    let path = format!("/rpc/fast?api-key={K6}");
+    let from = |ip: &'static str| [("x-forwarded-for", ip)];
+    assert_eq!(post(&env, &path, &from("1.1.1.1")).await.0, 200);
+    assert_eq!(post(&env, &path, &from("1.1.1.1")).await.0, 200);
+    let (status, v) = post(&env, &path, &from("1.1.1.1")).await;
+    assert_eq!((status, code(&v)), (429, -33092), "2 per minute from 1.1.1.1");
+    assert_eq!(post(&env, &path, &from("2.2.2.2")).await.0, 200, "another IP has its own; 3 of the key's 3 used");
+    assert_eq!(post(&env, &path, &from("3.3.3.3")).await.0, 429, "but the key's total is spent");
+
+    // Over a WebSocket, each message counts against the IP it connected from.
+    let ws_path = format!("{}?api-key={K6}", env.ws_url("fast"));
+    tokio::time::sleep(ms(1100)).await; // the key's total refilled: only the per-IP limit refuses below
+    let mut spent = Ws::connect_with(&ws_path, &from("1.1.1.1")).await;
+    assert_eq!(code(&spent.call("getLatestBlockhash", json!(null)).await), -33092, "1.1.1.1 is still spent");
+    let mut ws = Ws::connect_with(&ws_path, &from("4.4.4.4")).await;
+    assert!(ws.call("getLatestBlockhash", json!(null)).await.get("result").is_some());
+    assert!(ws.call("getLatestBlockhash", json!(null)).await.get("result").is_some());
+    assert_eq!(code(&ws.call("getLatestBlockhash", json!(null)).await), -33092);
 }
 
 #[tokio::test]

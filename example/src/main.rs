@@ -10,7 +10,7 @@ pub fn proxy() -> Result<ProxyBuilder, ConfigError> {
         .upstream("surf-a", Upstream::split("http://127.0.0.1:8899", "ws://127.0.0.1:8900"))
         .upstream("surf-b", Upstream::split("http://127.0.0.1:8999", "ws://127.0.0.1:9000"))
         .upstream("surf-c", Upstream::split("http://127.0.0.1:9099", "ws://127.0.0.1:9100"))
-        .api_key("limited", ApiKey::new("22222222-3333-4444-8555-666666666666").rps(5).routes(["cache"]))
+        .api_key("limited", ApiKey::new("22222222-3333-4444-8555-666666666666").total_rps(5).routes(["cache"]))
         .api_key("local", ApiKey::new("11111111-2222-4333-8444-555555555555").routes(["*"]))
         .route(
             "cache",

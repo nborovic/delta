@@ -53,7 +53,9 @@ trustedProxies = ["10.0.0.0/8"]       # optional: front proxies whose X-Forwarde
 [apiKeys.backend]                     # at least one key is required
 key = "${BACKEND_KEY}"                # a UUID
 routes = ["*"]
-rps = 500
+totalRps = 500                        # the whole key
+rpsPerIp = 20                         # each client IP (IPv6: each /64): bursts
+rpmPerIp = 600                        # ...and the minute
 
 [upstreams]
 helius = { http = "https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}", maxSubscriptionsPerConnection = 1000 }
@@ -77,7 +79,7 @@ sendTransaction    = false
 - **Policies**, on a route or a method: `cache = { ttl, namespace }`, `retry = { attempts, delay }`, `hedge = { upstreams }`, `quorum = { threshold, upstreams }`, `loadBalancing = { type, ... }`. Only one of retry, hedge and quorum per method; `false` turns an inherited one off. Writes (`sendTransaction`, `requestAirdrop`, `sendBundle`, other `send*`) follow them too; a cache or quorum on one loads with a warning.
 - **Batches** are forwarded as batches: elements whose methods use the same upstreams go together to one of them, picked by the route's `loadBalancing` for the route's upstreams and round-robin otherwise. Besides a method's upstreams, only the allow-list applies: refused elements are answered by delta and never sent.
 - **Upstreams:** a URL, or `{ http, ws, maxSubscriptionsPerConnection, maxConnections }`.
-- **API keys:** `key`, `routes`, `rps`, `allowedIps`, `allowedDomains`, `maxSubscriptions`. Every request sends `?api-key=<uuid>`.
+- **API keys:** `key`, `routes`, `totalRps`, `rpsPerIp`, `rpmPerIp`, `allowedIps`, `allowedDomains`, `maxSubscriptions`. Every request sends `?api-key=<uuid>`. `totalRps` limits the key as a whole; `rpsPerIp` and `rpmPerIp` limit each client IP, so devices behind one NAT share them. All count batch elements and WebSocket messages, per delta instance.
 - **Stores:** `[stores.moka]` with `maxSizeMb` and `maxEntryMb` sets the cache size.
 
 ## Errors

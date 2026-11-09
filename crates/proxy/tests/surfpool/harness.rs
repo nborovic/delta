@@ -825,6 +825,17 @@ impl Ws {
         Self::try_connect(url).await.unwrap_or_else(|e| panic!("websocket connect failed: {e}"))
     }
 
+    /// Connects with extra headers on the upgrade request.
+    pub async fn connect_with(url: &str, headers: &[(&str, &str)]) -> Ws {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.into_client_request().unwrap();
+        for (k, v) in headers {
+            req.headers_mut().insert(tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        let (stream, _) = tokio_tungstenite::connect_async(req).await.unwrap_or_else(|e| panic!("websocket connect failed: {e}"));
+        Ws { stream, notes: VecDeque::new(), responses: VecDeque::new(), next_id: 1000, close_reason: None, received: Vec::new() }
+    }
+
     pub async fn try_connect(url: &str) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
         let (stream, _) = tokio_tungstenite::connect_async(url).await?;
         Ok(Ws { stream, notes: VecDeque::new(), responses: VecDeque::new(), next_id: 1000, close_reason: None, received: Vec::new() })

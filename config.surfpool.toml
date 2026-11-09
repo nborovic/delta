@@ -24,7 +24,7 @@ routes = ["*"]
 [apiKeys.limited]
 key = "22222222-3333-4444-8555-666666666666"
 routes = ["cache"]
-rps = 5
+totalRps = 5
 
 [upstreams]
 surf-a = { http = "http://127.0.0.1:8899", ws = "ws://127.0.0.1:8900" }
