@@ -11,6 +11,8 @@ pub struct EffectivePolicies {
     /// `None` when caching is off (`ttl = 0`).
     pub cache: Option<CachePolicy>,
     pub mode: Mode,
+    /// `None`: a failed attempt is final.
+    pub retry: Option<RetryPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,18 +21,21 @@ pub struct CachePolicy {
     pub ttl: Duration,
 }
 
-/// Which upstream calls a request makes. At most one of retry, hedge and
-/// quorum applies.
+/// The upstream calls one attempt makes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
-    Single { retry: Option<RetryPolicy> },
+    /// One upstream.
+    Single,
+    /// N upstreams at once; the first success answers.
     Hedge { upstreams: usize },
+    /// N upstreams; `threshold` matching answers answer.
     Quorum { threshold: usize, upstreams: usize },
 }
 
+/// Runs the mode again after a failed attempt, whatever the mode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetryPolicy {
-    /// Extra tries after the first call.
+    /// Extra attempts after the first.
     pub attempts: u32,
     pub delay: Duration,
 }

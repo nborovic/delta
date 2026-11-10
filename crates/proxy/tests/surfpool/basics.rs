@@ -137,7 +137,7 @@ loadBalancing = { type = "priority", order = ["u1", "u0"] }
 [routes.r.methods]
 "*" = {}
 getSlot = false
-getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, quorum = { threshold = 2, upstreams = 2 } }
+getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, mode = { type = "quorum", threshold = 2, upstreams = 2 } }
 "#;
 
 #[tokio::test]

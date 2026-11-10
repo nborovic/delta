@@ -6,8 +6,8 @@ delta puts several RPC providers and nodes behind one endpoint and gives every U
 
 ## Features
 
-- **Per-route policies:** a method allow-list plus cache, retry, hedge, quorum and load balancing (round-robin, random, weighted, priority), with per-method overrides.
-- **Hedging and quorum:** race several upstreams and take the first success, or answer only when enough of them agree.
+- **Per-route policies:** a method allow-list plus cache, mode (single, hedge or quorum), retry and load balancing (round-robin, random, weighted, priority), with per-method overrides.
+- **Hedging and quorum:** race several upstreams and take the first success, or answer only when enough of them agree; retry runs either again when it fails.
 - **Upstream health** per upstream and per method, with backoff and a single probe before an upstream is used again.
 - **A Solana-aware cache:** data that can still change is stored only once it is finalized; errors and empty results never are.
 - **Deduplicated subscriptions:** opened on several upstreams, each notification forwarded once, one upstream subscription shared by many clients.
@@ -63,20 +63,23 @@ own-1  = { http = "http://10.0.0.11:8899", ws = "ws://10.0.0.11:8900" }
 
 [routes.fast]                         # served at /rpc/fast
 upstreams = ["*"]                     # the route's upstreams and policies apply to every method
-hedge = { upstreams = 2 }
+mode = { type = "hedge", upstreams = 2 }
+retry = { attempts = 2, delay = 100 }
 cache = { ttl = 200 }
 
 [routes.fast.methods]
 getAccountInfo     = {}
 getLatestBlockhash = { cache = { ttl = 0 } }
-getBlock           = { upstreams = ["own-1"], hedge = false }
+getBlock           = { upstreams = ["own-1"], mode = { type = "single" } }
 sendTransaction    = false
 ```
 
 [`config.example.toml`](config.example.toml) is a larger example.
 
 - **Methods:** keys are an exact name, a prefix glob (`"get*"`) or `"*"`; the most specific wins. `{}` accepts with the route's upstreams and policies, a table overrides them, `false` rejects. A method's `upstreams` replaces the route's and may name any upstream.
-- **Policies**, on a route or a method: `cache = { ttl, namespace }`, `retry = { attempts, delay }`, `hedge = { upstreams }`, `quorum = { threshold, upstreams }`, `loadBalancing = { type, ... }`. Only one of retry, hedge and quorum per method; `false` turns an inherited one off. Writes (`sendTransaction`, `requestAirdrop`, `sendBundle`, other `send*`) follow them too; a cache or quorum on one loads with a warning.
+- **Policies**, on a route or a method: `cache = { ttl, namespace }`, `mode`, `retry = { attempts, delay }`, `loadBalancing = { type, ... }`. A method's `mode` replaces the route's; `cache` and `retry` merge field by field, and `retry = false` turns an inherited retry off. Writes (`sendTransaction`, `requestAirdrop`, `sendBundle`, other `send*`) follow them too; a cache or quorum on one loads with a warning.
+- **Mode**, the upstream calls of one attempt: `{ type = "single" }` (the default) asks one upstream; `{ type = "hedge", upstreams }` races that many and takes the first success; `{ type = "quorum", threshold, upstreams }` asks that many and answers once `threshold` agree. `loadBalancing` picks the upstreams, skipping unhealthy ones.
+- **Retry** runs the mode again after `delay` ms, up to `attempts` more times, when an attempt fails: every upstream failed, or quorum was not reached. A result or a node's final error answers at once. Retries multiply the mode's calls, within the request's deadline.
 - **Batches** are forwarded as batches: elements whose methods use the same upstreams go together to one of them, picked by the route's `loadBalancing` for the route's upstreams and round-robin otherwise. Besides a method's upstreams, only the allow-list applies: refused elements are answered by delta and never sent.
 - **Upstreams:** a URL, or `{ http, ws, maxSubscriptionsPerConnection, maxConnections }`.
 - **API keys:** `key`, `routes`, `totalRps`, `rpsPerIp`, `rpmPerIp`, `allowedIps`, `allowedDomains`, `maxSubscriptions`. Every request sends `?api-key=<uuid>`. `totalRps` limits the key as a whole; `rpsPerIp` and `rpmPerIp` limit each client IP, so devices behind one NAT share them. All count batch elements and WebSocket messages, per delta instance.

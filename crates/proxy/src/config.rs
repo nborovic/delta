@@ -204,11 +204,9 @@ pub struct Route {
     #[serde(default)]
     pub cache: Option<Cache>,
     #[serde(default)]
+    pub mode: Option<Mode>,
+    #[serde(default)]
     pub retry: Option<Setting<Retry>>,
-    #[serde(default)]
-    pub hedge: Option<Setting<Hedge>>,
-    #[serde(default)]
-    pub quorum: Option<Setting<Quorum>>,
     pub methods: BTreeMap<String, MethodEntry>,
 }
 
@@ -218,9 +216,8 @@ impl Route {
             upstreams: upstreams.into_iter().map(Into::into).collect(),
             load_balancing: None,
             cache: None,
+            mode: None,
             retry: None,
-            hedge: None,
-            quorum: None,
             methods: BTreeMap::new(),
         }
     }
@@ -230,9 +227,8 @@ impl Route {
             upstreams: None,
             load_balancing: self.load_balancing.clone(),
             cache: self.cache.clone(),
+            mode: self.mode.clone(),
             retry: self.retry.clone(),
-            hedge: self.hedge.clone(),
-            quorum: self.quorum.clone(),
         }
     }
     pub fn load_balancing(mut self, lb: LoadBalancing) -> Self {
@@ -243,28 +239,16 @@ impl Route {
         self.cache = Some(cache);
         self
     }
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
     pub fn retry(mut self, retry: Retry) -> Self {
         self.retry = Some(Setting::On(retry));
         self
     }
     pub fn no_retry(mut self) -> Self {
         self.retry = Some(Setting::Off);
-        self
-    }
-    pub fn hedge(mut self, hedge: Hedge) -> Self {
-        self.hedge = Some(Setting::On(hedge));
-        self
-    }
-    pub fn no_hedge(mut self) -> Self {
-        self.hedge = Some(Setting::Off);
-        self
-    }
-    pub fn quorum(mut self, quorum: Quorum) -> Self {
-        self.quorum = Some(Setting::On(quorum));
-        self
-    }
-    pub fn no_quorum(mut self) -> Self {
-        self.quorum = Some(Setting::Off);
         self
     }
     /// Accepts a method (exact name, `prefix*` or `*`) with these overrides.
@@ -307,9 +291,9 @@ pub struct Policies {
     pub upstreams: Option<Vec<String>>,
     pub load_balancing: Option<LoadBalancing>,
     pub cache: Option<Cache>,
+    /// Replaces the route's mode whole.
+    pub mode: Option<Mode>,
     pub retry: Option<Setting<Retry>>,
-    pub hedge: Option<Setting<Hedge>>,
-    pub quorum: Option<Setting<Quorum>>,
 }
 
 impl Policies {
@@ -329,28 +313,16 @@ impl Policies {
         self.cache = Some(cache);
         self
     }
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
     pub fn retry(mut self, retry: Retry) -> Self {
         self.retry = Some(Setting::On(retry));
         self
     }
     pub fn no_retry(mut self) -> Self {
         self.retry = Some(Setting::Off);
-        self
-    }
-    pub fn hedge(mut self, hedge: Hedge) -> Self {
-        self.hedge = Some(Setting::On(hedge));
-        self
-    }
-    pub fn no_hedge(mut self) -> Self {
-        self.hedge = Some(Setting::Off);
-        self
-    }
-    pub fn quorum(mut self, quorum: Quorum) -> Self {
-        self.quorum = Some(Setting::On(quorum));
-        self
-    }
-    pub fn no_quorum(mut self) -> Self {
-        self.quorum = Some(Setting::Off);
         self
     }
 
@@ -420,12 +392,14 @@ pub enum Store {
     Moka,
 }
 
+/// Another attempt of the mode after a failed one: every upstream failed, or
+/// quorum was not reached.
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
-    /// Extra tries after the first call.
+    /// Extra attempts after the first.
     pub attempts: Option<u32>,
-    /// Milliseconds between tries.
+    /// Milliseconds between attempts.
     pub delay: Option<u64>,
 }
 
@@ -443,36 +417,55 @@ impl Retry {
     }
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Hedge {
-    pub upstreams: Option<usize>,
+/// The upstream calls one attempt makes: `{ type = "single" }`,
+/// `{ type = "hedge", upstreams }` or `{ type = "quorum", threshold, upstreams }`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mode {
+    /// One upstream, picked by `loadBalancing`. The default.
+    Single,
+    /// `upstreams` at once; the first success answers.
+    Hedge { upstreams: usize },
+    /// `upstreams` at once; `threshold` matching answers answer.
+    Quorum { threshold: usize, upstreams: usize },
 }
 
-impl Hedge {
-    pub fn upstreams(n: usize) -> Self {
-        Hedge { upstreams: Some(n) }
+impl Mode {
+    pub fn hedge(upstreams: usize) -> Self {
+        Mode::Hedge { upstreams }
+    }
+    pub fn quorum(threshold: usize, upstreams: usize) -> Self {
+        Mode::Quorum { threshold, upstreams }
     }
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Quorum {
-    pub threshold: Option<usize>,
-    pub upstreams: Option<usize>,
-}
-
-impl Quorum {
-    pub fn new(threshold: usize, upstreams: usize) -> Self {
-        Quorum { threshold: Some(threshold), upstreams: Some(upstreams) }
-    }
-    /// Only `threshold`; `upstreams` is inherited from the route.
-    pub fn threshold(threshold: usize) -> Self {
-        Quorum { threshold: Some(threshold), upstreams: None }
-    }
-    /// Only `upstreams`; `threshold` is inherited from the route.
-    pub fn upstreams(upstreams: usize) -> Self {
-        Quorum { threshold: None, upstreams: Some(upstreams) }
+impl<'de> Deserialize<'de> for Mode {
+    /// Hand-written like `LoadBalancing`: a field of another type is an error.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            r#type: String,
+            upstreams: Option<usize>,
+            threshold: Option<usize>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let mode = match raw.r#type.as_str() {
+            "single" => Mode::Single,
+            "hedge" => Mode::Hedge { upstreams: raw.upstreams.ok_or_else(|| D::Error::missing_field("upstreams"))? },
+            "quorum" => Mode::Quorum {
+                threshold: raw.threshold.ok_or_else(|| D::Error::missing_field("threshold"))?,
+                upstreams: raw.upstreams.ok_or_else(|| D::Error::missing_field("upstreams"))?,
+            },
+            other => return Err(D::Error::unknown_variant(other, &["single", "hedge", "quorum"])),
+        };
+        let stray = |field: &str| D::Error::custom(format!("`{field}` is not a field of mode type `{}`", raw.r#type));
+        if raw.upstreams.is_some() && mode == Mode::Single {
+            return Err(stray("upstreams"));
+        }
+        if raw.threshold.is_some() && !matches!(mode, Mode::Quorum { .. }) {
+            return Err(stray("threshold"));
+        }
+        Ok(mode)
     }
 }
 
@@ -640,6 +633,32 @@ mod tests {
         let text = "listen = \"0.0.0.0:1\"\n[upstreams]\na = \"http://a\"\n[routes.r]\nupstreams = [\"a\"]\nloadBalancing = { type = \"latency\" }\n[routes.r.methods]\nx = {}\n";
         let e = parse_toml(text, &|_| None).unwrap_err().to_string();
         assert!(e.contains("unknown variant `latency`, expected one of `round-robin`, `random`, `weighted`, `priority`"), "{e}");
+    }
+
+    #[test]
+    fn modes() {
+        let route = |extra: &str| {
+            format!("listen = \"0.0.0.0:1\"\n[upstreams]\na = \"http://a\"\n[routes.r]\nupstreams = [\"a\"]\n{extra}\n[routes.r.methods]\nx = {{}}\n")
+        };
+        let mode = |extra: &str| parse_toml(&route(extra), &|_| None).map(|c| c.routes["r"].mode.clone());
+        assert_eq!(mode("mode = { type = \"single\" }").unwrap(), Some(Mode::Single));
+        assert_eq!(mode("mode = { type = \"hedge\", upstreams = 2 }").unwrap(), Some(Mode::hedge(2)));
+        assert_eq!(mode("mode = { type = \"quorum\", threshold = 2, upstreams = 3 }").unwrap(), Some(Mode::quorum(2, 3)));
+        for (extra, expected) in [
+            ("mode = { type = \"hedge\" }", "missing field `upstreams`"),
+            ("mode = { type = \"quorum\", upstreams = 3 }", "missing field `threshold`"),
+            ("mode = { type = \"single\", upstreams = 2 }", "`upstreams` is not a field of mode type `single`"),
+            ("mode = { type = \"hedge\", upstreams = 2, threshold = 1 }", "`threshold` is not a field of mode type `hedge`"),
+            ("mode = { type = \"retry\" }", "unknown variant `retry`, expected one of `single`, `hedge`, `quorum`"),
+            ("mode = false", ""),
+            // The old keys are gone; the error lists `mode` instead.
+            ("hedge = { upstreams = 2 }", "unknown field `hedge`"),
+        ] {
+            let e = mode(extra).unwrap_err().to_string();
+            assert!(e.contains(expected), "{extra}: {e}");
+        }
+        let e = mode("hedge = { upstreams = 2 }").unwrap_err().to_string();
+        assert!(e.contains("`mode`"), "{e}");
     }
 
     #[test]

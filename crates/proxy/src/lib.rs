@@ -15,7 +15,7 @@
 //!         .upstream("helius", Upstream::url(format!("https://mainnet.helius-rpc.com/?api-key={}", env("HELIUS_KEY")?)))
 //!         .api_key("backend", ApiKey::new(env("BACKEND_KEY")?).total_rps(500).routes(["*"]))
 //!         .route("fast", Route::new(["helius"])
-//!             .load_balancing(LoadBalancing::RoundRobin).cache(Cache::ttl(200)).hedge(Hedge::upstreams(1))
+//!             .load_balancing(LoadBalancing::RoundRobin).cache(Cache::ttl(200)).mode(Mode::hedge(1))
 //!             .method("getAccountInfo", Policies::new()))
 //!         .build()?
 //!         .run()
@@ -44,7 +44,7 @@ use tokio::net::TcpListener;
 pub use delta_engine::{HealthLimits, Limits};
 
 pub use config::{
-    env, ApiKey, Cache, Config, ConfigError, Hedge, LoadBalancing, Moka, Policies, Quorum, Retry, Route, Store, Upstream,
+    env, ApiKey, Cache, Config, ConfigError, LoadBalancing, Mode, Moka, Policies, Retry, Route, Store, Upstream,
 };
 
 use app::App;

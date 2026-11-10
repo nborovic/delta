@@ -8,14 +8,14 @@ use crate::harness::*;
 const ROUTES: &str = r#"
 [routes.fast]
 upstreams = ["*"]
-hedge = { upstreams = 2 }
+mode = { type = "hedge", upstreams = 2 }
 cache = { ttl = 60000 }
 [routes.fast.methods]
 "*" = {}
 
 [routes.safe]
 upstreams = ["*"]
-quorum = { threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, upstreams = 2 }
 [routes.safe.methods]
 getBalance = {}
 "#;

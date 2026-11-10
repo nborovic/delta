@@ -178,7 +178,7 @@ impl App {
     /// The rest are grouped by the upstreams their methods use; each group
     /// goes, as one batch, to one upstream from its list (the route's
     /// `loadBalancing` for the route's list, round-robin otherwise). No
-    /// cache, retry, hedge or quorum. One answer per element (a
+    /// cache, mode or retry. One answer per element (a
     /// notification's is never sent).
     pub async fn call_batch(&self, route: Option<&RouteTable>, reqs: &[&RpcRequest], arrived: Instant, who: &Who) -> Vec<Answer> {
         let mut answers: Vec<Option<Answer>> = Vec::with_capacity(reqs.len());

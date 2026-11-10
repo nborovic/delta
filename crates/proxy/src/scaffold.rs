@@ -343,6 +343,12 @@ impl Gen {
             }
             write!(out, ".cache({cache})").unwrap();
         }
+        match &p.mode {
+            None => {}
+            Some(Mode::Single) => out.push_str(".mode(Mode::Single)"),
+            Some(Mode::Hedge { upstreams }) => write!(out, ".mode(Mode::hedge({upstreams}))").unwrap(),
+            Some(Mode::Quorum { threshold, upstreams }) => write!(out, ".mode(Mode::quorum({threshold}, {upstreams}))").unwrap(),
+        }
         match &p.retry {
             None => {}
             Some(Setting::Off) => out.push_str(".no_retry()"),
@@ -354,27 +360,6 @@ impl Gen {
                     (None, None) => "Retry::default()".to_owned(),
                 };
                 write!(out, ".retry({r})").unwrap();
-            }
-        }
-        match &p.hedge {
-            None => {}
-            Some(Setting::Off) => out.push_str(".no_hedge()"),
-            Some(Setting::On(h)) => match h.upstreams {
-                Some(n) => write!(out, ".hedge(Hedge::upstreams({n}))").unwrap(),
-                None => out.push_str(".hedge(Hedge::default())"),
-            },
-        }
-        match &p.quorum {
-            None => {}
-            Some(Setting::Off) => out.push_str(".no_quorum()"),
-            Some(Setting::On(q)) => {
-                let q = match (q.threshold, q.upstreams) {
-                    (Some(t), Some(n)) => format!("Quorum::new({t}, {n})"),
-                    (Some(t), None) => format!("Quorum::threshold({t})"),
-                    (None, Some(n)) => format!("Quorum::upstreams({n})"),
-                    (None, None) => "Quorum::default()".to_owned(),
-                };
-                write!(out, ".quorum({q})").unwrap();
             }
         }
         out
@@ -444,7 +429,9 @@ mod tests {
             ".api_key(\"backend\", ApiKey::new(env(\"BACKEND_KEY\")?).total_rps(500).routes([\"*\"]))",
             "ApiKey::new(\"3f8a2c1e-7b4d-4e9a-b6c2-1d5e8f0a9b37\").total_rps(20).rps_per_ip(5).rpm_per_ip(120)",
             ".reject(\"sendTransaction\")",
-            ".method(\"getSlot\", Policies::new().cache(Cache::ttl(0)).retry(Retry::new(3, 50)).no_quorum())",
+            ".method(\"getSlot\", Policies::new().cache(Cache::ttl(0)).mode(Mode::Single).retry(Retry::new(3, 50)))",
+            ".mode(Mode::quorum(2, 3)).retry(Retry::new(1, 200))",
+            ".mode(Mode::hedge(4))",
             "LoadBalancing::priority([\"own-*\", \"helius\"])",
             "//! - `INDEXER_KEY`",
         ] {

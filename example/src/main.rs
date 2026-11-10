@@ -24,12 +24,12 @@ pub fn proxy() -> Result<ProxyBuilder, ConfigError> {
         )
         .route(
             "hedge",
-            Route::new(["surf-a", "surf-b"]).hedge(Hedge::upstreams(2))
+            Route::new(["surf-a", "surf-b"]).mode(Mode::hedge(2))
                 .method("*", Policies::new())
         )
         .route(
             "safe",
-            Route::new(["*"]).quorum(Quorum::new(2, 3))
+            Route::new(["*"]).mode(Mode::quorum(2, 3))
                 .method("getAccountInfo", Policies::new())
                 .method("getBalance", Policies::new())
         )

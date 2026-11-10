@@ -338,7 +338,8 @@ fn resolve_route(
                     MethodPlan::Accept(Arc::new(EffectivePolicies {
                         selector: Selector::new(candidates, Strategy::RoundRobin),
                         cache: None,
-                        mode: Mode::Single { retry: None },
+                        mode: Mode::Single,
+                        retry: None,
                     }))
                 } else {
                     let merged = merge(&route.policies(), over);
@@ -389,9 +390,9 @@ fn resolve_route(
     Some(table)
 }
 
-/// Merge rules: unset fields inherit; tables merge field by field;
-/// `upstreams` and `loadBalancing` are replaced whole; `false` turns an
-/// inherited policy off.
+/// Merge rules: unset fields inherit; `cache` and `retry` merge field by
+/// field; `upstreams`, `loadBalancing` and `mode` are replaced whole; `false`
+/// turns an inherited retry off.
 pub fn merge(defaults: &Policies, over: &Policies) -> Policies {
     fn setting<T: Clone>(d: &Option<Setting<T>>, o: &Option<Setting<T>>, f: impl Fn(&T, &T) -> T) -> Option<Setting<T>> {
         match (d, o) {
@@ -412,14 +413,10 @@ pub fn merge(defaults: &Policies, over: &Policies) -> Policies {
             }),
             (d, o) => o.clone().or_else(|| d.clone()),
         },
+        mode: over.mode.clone().or_else(|| defaults.mode.clone()),
         retry: setting(&defaults.retry, &over.retry, |d, o| Retry {
             attempts: o.attempts.or(d.attempts),
             delay: o.delay.or(d.delay),
-        }),
-        hedge: setting(&defaults.hedge, &over.hedge, |d, o| Hedge { upstreams: o.upstreams.or(d.upstreams) }),
-        quorum: setting(&defaults.quorum, &over.quorum, |d, o| Quorum {
-            threshold: o.threshold.or(d.threshold),
-            upstreams: o.upstreams.or(d.upstreams),
         }),
     }
 }
@@ -438,32 +435,6 @@ fn effective(
     let before = errors.len();
     let matched = candidates.len();
 
-    // Exclusivity, checked on the merged result.
-    let on: Vec<&str> = [
-        ("hedge", merged.hedge.as_ref().and_then(Setting::on).is_some()),
-        ("quorum", merged.quorum.as_ref().and_then(Setting::on).is_some()),
-        ("retry", merged.retry.as_ref().and_then(Setting::on).is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(n, on)| on.then_some(n))
-    .collect();
-    if on.len() > 1 {
-        let set_here = |n: &str| match n {
-            "hedge" => over.hedge.is_some(),
-            "quorum" => over.quorum.is_some(),
-            _ => over.retry.is_some(),
-        };
-        let inherited: Vec<&str> = on.iter().copied().filter(|n| !set_here(n)).collect();
-        let mut msg = format!("{mpath}: {} are exclusive", join_and(&on));
-        if let Some(&inh) = inherited.first() {
-            let mine = on.iter().copied().find(|n| *n != inh).unwrap_or(inh);
-            msg.push_str(&format!(
-                "\n  ({inh} inherited from {rpath}; set {inh} = false to use {mine})"
-            ));
-        }
-        errors.push(msg);
-    }
-
     let cache = match &merged.cache {
         None => None,
         Some(c) => match c.ttl {
@@ -479,45 +450,34 @@ fn effective(
         },
     };
 
-    let mut mode = Mode::Single { retry: None };
+    // Where an error in the mode comes from, when the method did not set it.
+    let from = if over.mode.is_none() && merged.mode.is_some() { format!(" (mode set in {rpath})") } else { String::new() };
+    let mode = match merged.mode.clone().unwrap_or(crate::config::Mode::Single) {
+        crate::config::Mode::Single => Mode::Single,
+        crate::config::Mode::Hedge { upstreams: n } => {
+            if n == 0 || n > matched {
+                errors.push(format!(
+                    "{mpath}: hedge needs 1 <= upstreams ({n}) <= the {matched} upstreams this method uses{from}"
+                ));
+            }
+            Mode::Hedge { upstreams: n }
+        }
+        crate::config::Mode::Quorum { threshold: t, upstreams: n } => {
+            if t == 0 || t > n || n > matched {
+                errors.push(format!(
+                    "{mpath}: quorum needs 1 <= threshold ({t}) <= upstreams ({n}) <= the {matched} upstreams this method uses{from}"
+                ));
+            }
+            Mode::Quorum { threshold: t, upstreams: n }
+        }
+    };
+    let mut retry = None;
     if let Some(r) = merged.retry.as_ref().and_then(Setting::on) {
         match (r.attempts, r.delay) {
-            (Some(attempts), Some(delay)) => {
-                mode = Mode::Single { retry: Some(RetryPolicy { attempts, delay: Duration::from_millis(delay) }) }
-            }
+            (Some(attempts), Some(delay)) => retry = Some(RetryPolicy { attempts, delay: Duration::from_millis(delay) }),
             (a, d) => {
                 let missing: Vec<&str> =
                     [("retry.attempts", a.is_none()), ("retry.delay", d.is_none())].into_iter().filter(|x| x.1).map(|x| x.0).collect();
-                errors.push(format!("{mpath}: {} is required (set it here or in {rpath})", join_and(&missing)));
-            }
-        }
-    }
-    if let Some(h) = merged.hedge.as_ref().and_then(Setting::on) {
-        match h.upstreams {
-            None => errors.push(format!("{mpath}: hedge.upstreams is required (set it here or in {rpath})")),
-            Some(n) if n == 0 || n > matched => errors.push(format!(
-                "{mpath}: hedge.upstreams = {n} must be between 1 and the {matched} upstreams this method uses"
-            )),
-            Some(n) => mode = Mode::Hedge { upstreams: n },
-        }
-    }
-    if let Some(q) = merged.quorum.as_ref().and_then(Setting::on) {
-        match (q.threshold, q.upstreams) {
-            (Some(t), Some(n)) => {
-                if t == 0 || t > n || n > matched {
-                    errors.push(format!(
-                        "{mpath}: quorum needs 1 <= threshold ({t}) <= upstreams ({n}) <= the {matched} upstreams this method uses"
-                    ));
-                } else {
-                    mode = Mode::Quorum { threshold: t, upstreams: n };
-                }
-            }
-            (t, n) => {
-                let missing: Vec<&str> = [("quorum.threshold", t.is_none()), ("quorum.upstreams", n.is_none())]
-                    .into_iter()
-                    .filter(|x| x.1)
-                    .map(|x| x.0)
-                    .collect();
                 errors.push(format!("{mpath}: {} is required (set it here or in {rpath})", join_and(&missing)));
             }
         }
@@ -528,6 +488,7 @@ fn effective(
         selector: Selector::new(candidates.to_vec(), strategy),
         cache,
         mode,
+        retry,
     })
 }
 
@@ -633,7 +594,7 @@ fn warn_risky_writes(t: &RouteTable, warnings: &mut Vec<String>) {
         if matches!(p.mode, Mode::Quorum { .. }) {
             warnings.push(format!(
                 "{path}: `{m}` is a write under quorum: it is sent to every quorum member, and when one answers \
-                 \"already processed\" the answers disagree and the client gets -33094 (set quorum = false on it)"
+                 \"already processed\" the answers disagree and the client gets -33094 (give it a mode other than quorum)"
             ));
         }
     }
@@ -655,11 +616,10 @@ fn warn_unused_policies(path: &str, route: &Route, warnings: &mut Vec<String>) {
     }
     type Overrides = fn(&Policies) -> bool;
     // loadBalancing is left out: batches always use the route's.
-    let checks: [(&str, bool, Overrides); 4] = [
+    let checks: [(&str, bool, Overrides); 3] = [
         ("cache", d.cache.is_some(), |p| p.cache.as_ref().is_some_and(|c| c.ttl.is_some())),
+        ("mode", d.mode.is_some(), |p| p.mode.is_some()),
         ("retry", d.retry.is_some(), |p| p.retry.is_some()),
-        ("hedge", d.hedge.is_some(), |p| p.hedge.is_some()),
-        ("quorum", d.quorum.is_some(), |p| p.quorum.is_some()),
     ];
     for (name, set, overridden) in checks {
         if !set {
@@ -822,14 +782,18 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
 
         let safe = &r.routes["safe"];
         assert!(matches!(safe.lookup("sendTransaction"), Some(MethodPlan::Reject)));
+        let once = Some(RetryPolicy { attempts: 1, delay: Duration::from_millis(200) });
         let any = safe.accepted("getBalance").unwrap();
         assert_eq!(any.mode, Mode::Quorum { threshold: 2, upstreams: 3 });
+        assert_eq!(any.retry, once);
         assert_eq!(any.cache.as_ref().unwrap().namespace, "verified");
         let slot = safe.accepted("getSlot").unwrap();
         assert!(slot.cache.is_none());
-        assert!(matches!(slot.mode, Mode::Single { retry: Some(_) }));
+        assert_eq!(slot.mode, Mode::Single);
+        assert_eq!(slot.retry, Some(RetryPolicy { attempts: 3, delay: Duration::from_millis(50) }));
         let bh = safe.accepted("getLatestBlockhash").unwrap();
         assert_eq!(bh.mode, Mode::Hedge { upstreams: 2 });
+        assert_eq!(bh.retry, once, "a method's own mode keeps the route's retry");
         let block = safe.accepted("getBlock").unwrap();
         assert_eq!(block.cache.as_ref().unwrap().ttl, Duration::from_millis(86_400_000));
 
@@ -866,47 +830,41 @@ getBlockTime = false
     }
 
     #[test]
-    fn exclusivity_error_names_the_inherited_policy() {
-        let e = err(
-            r#"
-[routes.safe]
-upstreams = ["*"]
-quorum = { threshold = 2, upstreams = 3 }
-[routes.safe.methods]
-getLatestBlockhash = { quorum = false, hedge = { upstreams = 2 } }
-getSlot            = { hedge = { upstreams = 2 } }
-"#,
-        );
-        assert!(e.contains("routes.safe.methods.getSlot: hedge and quorum are exclusive"), "{e}");
-        assert!(
-            e.contains("(quorum inherited from routes.safe; set quorum = false to use hedge)"),
-            "{e}"
-        );
-        assert!(!e.contains("getLatestBlockhash"), "{e}");
-    }
-
-    #[test]
-    fn field_merge_and_required_fields() {
+    fn mode_is_replaced_whole_and_retry_inherited_apart() {
         let r = load(
             r#"
 [routes.r]
 upstreams = ["*"]
+mode = { type = "quorum", threshold = 2, upstreams = 3 }
 retry = { attempts = 3, delay = 50 }
 [routes.r.methods]
-getSlot = { retry = { attempts = 5 } }
+getBalance         = {}
+getSlot            = { retry = { attempts = 5 } }
+getLatestBlockhash = { mode = { type = "hedge", upstreams = 2 } }
+getBlock           = { mode = { type = "single" }, retry = false }
 "#,
         )
         .unwrap();
-        let p = r.routes["r"].accepted("getSlot").unwrap();
-        assert_eq!(
-            p.mode,
-            Mode::Single { retry: Some(RetryPolicy { attempts: 5, delay: Duration::from_millis(50) }) }
-        );
+        let t = &r.routes["r"];
+        let retry = |attempts| Some(RetryPolicy { attempts, delay: Duration::from_millis(50) });
+        let p = t.accepted("getBalance").unwrap();
+        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, upstreams: 3 }, &retry(3)));
+        let p = t.accepted("getSlot").unwrap();
+        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, upstreams: 3 }, &retry(5)));
+        let p = t.accepted("getLatestBlockhash").unwrap();
+        assert_eq!((&p.mode, &p.retry), (&Mode::Hedge { upstreams: 2 }, &retry(3)));
+        let p = t.accepted("getBlock").unwrap();
+        assert_eq!((&p.mode, &p.retry), (&Mode::Single, &None));
 
+        let p = load("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = {}\n").unwrap();
+        let p = p.routes["r"].accepted("x").unwrap().clone();
+        assert_eq!((&p.mode, &p.retry), (&Mode::Single, &None), "the default");
+    }
+
+    #[test]
+    fn required_fields() {
         let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { retry = { attempts = 3 } }\n");
         assert!(e.contains("retry.delay is required"), "{e}");
-        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { quorum = { threshold = 2 } }\n");
-        assert!(e.contains("quorum.upstreams is required"), "{e}");
         let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { cache = { namespace = \"n\" } }\n");
         assert!(e.contains("cache.ttl is required"), "{e}");
     }
@@ -917,8 +875,9 @@ getSlot = { retry = { attempts = 5 } }
             ("[routes.r]\nupstreams = [\"own-9\"]\n[routes.r.methods]\nx = {}\n", "`own-9` matches no upstream"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\n\"*Subscribe\" = {}\n", "a method key is"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = false\n", "must accept at least one method"),
-            ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { quorum = { threshold = 2, upstreams = 3 } }\n", "quorum needs"),
-            ("[routes.r]\nupstreams = [\"own-1\"]\n[routes.r.methods]\nx = { hedge = { upstreams = 2 } }\n", "hedge.upstreams = 2"),
+            ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { mode = { type = \"quorum\", threshold = 2, upstreams = 3 } }\n", "quorum needs 1 <= threshold (2) <= upstreams (3) <= the 2 upstreams"),
+            ("[routes.r]\nupstreams = [\"own-1\"]\n[routes.r.methods]\nx = { mode = { type = \"hedge\", upstreams = 2 } }\n", "x: hedge needs 1 <= upstreams (2) <= the 1 upstreams this method uses"),
+            ("[routes.r]\nupstreams = [\"own-1\"]\nmode = { type = \"hedge\", upstreams = 0 }\n[routes.r.methods]\nx = {}\n", "(mode set in routes.r)"),
             ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { loadBalancing = { type = \"priority\", order = [\"triton\"] } }\n", "order entry `triton`"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { loadBalancing = { type = \"weighted\", weights = { helius = 0 } } }\n", "weights.helius must be at least 1"),
             ("[routes.r]\nupstreams = [\"*\"]\n", "methods"),
@@ -973,13 +932,23 @@ getSlot = { retry = { attempts = 5 } }
 [routes.stream]
 upstreams = ["helius"]
 cache = { ttl = 100 }
+retry = { attempts = 1, delay = 10 }
 [routes.stream.methods]
 accountSubscribe = {}
+
+[routes.r]
+upstreams = ["*"]
+mode = { type = "hedge", upstreams = 2 }
+[routes.r.methods]
+getSlot = { mode = { type = "single" } }
 "#,
         )
         .unwrap();
-        assert!(r.warnings.iter().any(|w| w.contains("ignored for subscription methods")), "{:?}", r.warnings);
-        assert!(r.warnings.iter().any(|w| w.contains("routes.stream.cache: no accepted method uses it")), "{:?}", r.warnings);
+        let has = |s: &str| r.warnings.iter().any(|w| w.contains(s));
+        assert!(has("ignored for subscription methods"), "{:?}", r.warnings);
+        assert!(has("routes.stream.cache: no accepted method uses it"), "{:?}", r.warnings);
+        assert!(has("routes.stream.retry: no accepted method uses it"), "{:?}", r.warnings);
+        assert!(has("routes.r.mode: no accepted method uses it"), "{:?}", r.warnings);
     }
 
     #[test]
@@ -1056,7 +1025,7 @@ accountSubscribe = {}
             r#"
 [routes.r]
 upstreams = ["own-*"]
-quorum = { threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, upstreams = 2 }
 [routes.r.methods]
 getSlot = {}
 getBalance = { upstreams = ["helius", "triton"], loadBalancing = { type = "priority", order = ["triton"] } }
@@ -1076,8 +1045,8 @@ accountSubscribe = { upstreams = ["helius"] }
         assert!(e.contains("routes.r.methods.x.upstreams: `nope` matches no upstream"), "{e}");
         assert!(e.contains("routes.r.methods.y.upstreams: at least one upstream is required"), "{e}");
         // Counted against the method's own upstreams.
-        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { upstreams = [\"helius\"], hedge = { upstreams = 2 } }\n");
-        assert!(e.contains("between 1 and the 1 upstreams this method uses"), "{e}");
+        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { upstreams = [\"helius\"], mode = { type = \"hedge\", upstreams = 2 } }\n");
+        assert!(e.contains("<= the 1 upstreams this method uses"), "{e}");
     }
 
     #[test]
@@ -1102,7 +1071,7 @@ requestAirdrop = { cache = { ttl = 0 } }
 
 [routes.q]
 upstreams = ["*"]
-quorum = { threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, upstreams = 2 }
 [routes.q.methods]
 "send*" = {}
 "#,

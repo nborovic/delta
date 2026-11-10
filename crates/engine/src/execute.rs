@@ -1,5 +1,6 @@
-//! Policy execution in a fixed order: hedge, quorum or retry decides the
-//! upstream calls; each call goes through the cache, then the upstream.
+//! Policy execution: the mode (single, hedge or quorum) decides the upstream
+//! calls of one attempt, retry runs another attempt after a failed one, and
+//! each call goes through the cache, then the upstream.
 //!
 //! Every upstream call runs in its own task. Hedge, quorum and client
 //! disconnects only stop waiting for a call; they never abort it, so every
@@ -19,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::cache::Cached;
 use crate::health::Signal;
 use crate::jsonrpc::{self, Answer, RpcError};
-use crate::policy::{EffectivePolicies, Mode, RetryPolicy};
+use crate::policy::{EffectivePolicies, Mode};
 use crate::shared::Shared;
 use crate::solana::{self, Finality};
 use crate::upstream::{TransportError, UpstreamId};
@@ -98,11 +99,7 @@ pub async fn execute(shared: &Arc<Shared>, policies: &EffectivePolicies, req: Re
         deadline,
         calls: AtomicU32::new(0),
     });
-    let (answer, by) = match &policies.mode {
-        Mode::Hedge { upstreams } => hedge(&ctx, policies, *upstreams).await,
-        Mode::Quorum { threshold, upstreams } => quorum(&ctx, policies, *threshold, *upstreams).await,
-        Mode::Single { retry } => single(&ctx, policies, retry.as_ref()).await,
-    };
+    let (answer, by) = attempts(&ctx, policies).await;
     let cache = match (&ctx.cache, by) {
         (None, _) => CacheUse::Off,
         (Some(_), Some((_, true))) => CacheUse::Hit,
@@ -158,9 +155,9 @@ impl FailureLog {
         self.last_reason = f.reason;
     }
 
-    fn into_answer(self) -> Answer {
-        match self.last_rpc {
-            Some(e) => Answer::Error(e),
+    fn answer(&self) -> Answer {
+        match &self.last_rpc {
+            Some(e) => Answer::Error(e.clone()),
             None => Answer::error(jsonrpc::UPSTREAM_FAILED, format!("upstream failed: {}", self.last_reason)),
         }
     }
@@ -185,11 +182,18 @@ fn spawn_call(ctx: &Arc<CallCtx>, up: UpstreamId) -> impl std::future::Future<Ou
     }
 }
 
-/// Plain call, with optional retries. After a failed call it waits `delay`
-/// and asks the selector again with no exclusions.
-async fn single(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, retry: Option<&RetryPolicy>) -> (Answer, AnsweredBy) {
+/// Runs the mode, and again after `delay` for each retry while an attempt
+/// fails and the deadline allows. A failed attempt is one another attempt
+/// may turn around: every upstream failed, or quorum was not reached. A
+/// result or a node's final JSON-RPC error answers at once. Each attempt
+/// asks the selector afresh, which skips unhealthy upstreams.
+async fn attempts(ctx: &Arc<CallCtx>, policies: &EffectivePolicies) -> (Answer, AnsweredBy) {
+    let retry = policies.retry.as_ref();
     let attempts = 1 + retry.map_or(0, |r| r.attempts);
+    // Shared by every attempt: the client gets the last upstream JSON-RPC
+    // error of any of them.
     let mut log = FailureLog::new();
+    let mut failed = None;
     for attempt in 0..attempts {
         if attempt > 0 {
             let delay = retry.map_or(Duration::ZERO, |r| r.delay);
@@ -200,31 +204,57 @@ async fn single(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, retry: Option<
             log.add(Failure { reason: "deadline".into(), rpc_error: None });
             break;
         }
-        let Some(&up) = policies.selector.pick(&ctx.shared, &ctx.method, 1, &[]).first() else {
-            log.add(Failure { reason: "no upstream available".into(), rpc_error: None });
-            continue;
+        let outcome = match &policies.mode {
+            Mode::Single => single(ctx, policies, &mut log).await,
+            Mode::Hedge { upstreams } => hedge(ctx, policies, *upstreams, &mut log).await,
+            Mode::Quorum { threshold, upstreams } => quorum(ctx, policies, *threshold, *upstreams).await,
         };
-        match tokio::time::timeout_at(ctx.deadline.into(), spawn_call(ctx, up)).await {
-            Err(_) => {
-                log.add(Failure { reason: "deadline".into(), rpc_error: None });
-                break;
-            }
-            Ok(s) => match s.result {
-                Ok(answer) => return (answer, Some((s.up, s.from_cache))),
-                Err(f) => log.add(f),
-            },
+        match outcome {
+            Attempt::Answered(answer, by) => return (answer, by),
+            Attempt::Failed(answer) => failed = answer,
         }
     }
-    (log.into_answer(), None)
+    (failed.unwrap_or_else(|| log.answer()), None)
+}
+
+/// How one attempt ended.
+enum Attempt {
+    /// A result, or a final error another attempt would repeat.
+    Answered(Answer, AnsweredBy),
+    /// Worth another attempt. `None`: the failure log says why.
+    Failed(Option<Answer>),
+}
+
+/// One call to one upstream.
+async fn single(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, log: &mut FailureLog) -> Attempt {
+    let Some(&up) = policies.selector.pick(&ctx.shared, &ctx.method, 1, &[]).first() else {
+        log.add(Failure { reason: "no upstream available".into(), rpc_error: None });
+        return Attempt::Failed(None);
+    };
+    match tokio::time::timeout_at(ctx.deadline.into(), spawn_call(ctx, up)).await {
+        Err(_) => {
+            log.add(Failure { reason: "deadline".into(), rpc_error: None });
+            Attempt::Failed(None)
+        }
+        Ok(s) => match s.result {
+            Ok(answer) => Attempt::Answered(answer, Some((s.up, s.from_cache))),
+            Err(f) => {
+                log.add(f);
+                Attempt::Failed(None)
+            }
+        },
+    }
 }
 
 /// Sends to N upstreams at once and returns the first success. An error
 /// never ends the race; the first final error is returned only if no
-/// participant succeeds.
-async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize) -> (Answer, AnsweredBy) {
+/// participant succeeds, and the attempt fails only if none answered.
+async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize, log: &mut FailureLog) -> Attempt {
     let picks = policies.selector.pick(&ctx.shared, &ctx.method, n, &[]);
+    if picks.is_empty() {
+        log.add(Failure { reason: "no upstream available".into(), rpc_error: None });
+    }
     let mut racing: FuturesUnordered<_> = picks.iter().map(|&up| spawn_call(ctx, up)).collect();
-    let mut log = FailureLog::new();
     let mut first_final: Option<(RpcError, UpstreamId, bool)> = None;
     loop {
         match tokio::time::timeout_at(ctx.deadline.into(), racing.next()).await {
@@ -234,7 +264,7 @@ async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize) -> (A
             }
             Ok(None) => break,
             Ok(Some(s)) => match s.result {
-                Ok(Answer::Result(body)) => return (Answer::Result(body), Some((s.up, s.from_cache))),
+                Ok(Answer::Result(body)) => return Attempt::Answered(Answer::Result(body), Some((s.up, s.from_cache))),
                 Ok(Answer::Error(e)) => {
                     first_final.get_or_insert((e, s.up, s.from_cache));
                 }
@@ -243,15 +273,15 @@ async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize) -> (A
         }
     }
     match first_final {
-        Some((e, up, cached)) => (Answer::Error(e), Some((up, cached))),
-        None => (log.into_answer(), None),
+        Some((e, up, cached)) => Attempt::Answered(Answer::Error(e), Some((up, cached))),
+        None => Attempt::Failed(None),
     }
 }
 
-/// Sends to N upstreams and returns once `threshold` normalised answers
-/// match. Never falls back to the most common answer.
-async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usize, n: usize) -> (Answer, AnsweredBy) {
-    let not_reached = || (Answer::error(jsonrpc::QUORUM_NOT_REACHED, "quorum not reached"), None);
+/// Sends to N upstreams and answers once `threshold` normalised answers
+/// match. Never falls back to the most common answer: the attempt fails.
+async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usize, n: usize) -> Attempt {
+    let not_reached = || Attempt::Failed(Some(Answer::error(jsonrpc::QUORUM_NOT_REACHED, "quorum not reached")));
     let picks = policies.selector.pick(&ctx.shared, &ctx.method, n, &[]);
     if picks.len() < threshold {
         return not_reached();
@@ -274,7 +304,7 @@ async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usi
             let count = groups.entry(key).or_default();
             *count += 1;
             if *count >= threshold {
-                return (answer, Some((up, from_cache)));
+                return Attempt::Answered(answer, Some((up, from_cache)));
             }
         }
         let best = groups.values().copied().max().unwrap_or(0);
@@ -449,7 +479,7 @@ pub struct BatchItem<'a> {
 pub const BATCH_METHOD: &str = "batch";
 
 /// Sends a client batch to one upstream as one batch, picked by `selector`.
-/// No cache, retry, hedge or quorum: a batch is forwarded as it is. Returns
+/// No cache, mode or retry: a batch is forwarded as it is. Returns
 /// one answer per item (`None` for notifications).
 pub async fn forward_batch(
     shared: &Arc<Shared>,
