@@ -69,6 +69,22 @@ impl RouteTable {
         }
     }
 
+    fn plans(&self) -> impl Iterator<Item = &Arc<EffectivePolicies>> {
+        let all = self.exact.values().chain(self.prefixes.iter().map(|(_, p)| p)).chain(self.any.iter());
+        all.filter_map(|p| match p {
+            MethodPlan::Accept(p) => Some(p),
+            MethodPlan::Reject => None,
+        })
+    }
+
+    fn plans_mut(&mut self) -> impl Iterator<Item = &mut Arc<EffectivePolicies>> {
+        let all = self.exact.values_mut().chain(self.prefixes.iter_mut().map(|(_, p)| p)).chain(self.any.iter_mut());
+        all.filter_map(|p| match p {
+            MethodPlan::Accept(p) => Some(p),
+            MethodPlan::Reject => None,
+        })
+    }
+
     /// The selector for the part of a batch that goes to `upstreams` (an
     /// accepted method's list).
     pub fn batch_selector(&self, upstreams: &[UpstreamId]) -> &Selector {
@@ -143,12 +159,14 @@ pub fn resolve(config: &Config) -> Result<Resolved, ConfigError> {
     }
     let names: Vec<&str> = upstreams.iter().map(|u| u.name.as_str()).collect();
 
-    let mut routes = HashMap::new();
+    let mut tables = Vec::new();
     for (route_name, route) in &config.routes {
         if let Some(table) = resolve_route(route_name, route, &names, &mut errors, &mut warnings) {
-            routes.insert(route_name.clone(), Arc::new(table));
+            tables.push(table);
         }
     }
+    keep_for_the_longest_ttl(&mut tables);
+    let routes: HashMap<String, Arc<RouteTable>> = tables.into_iter().map(|t| (t.name.clone(), Arc::new(t))).collect();
     if config.routes.is_empty() {
         errors.push("routes: at least one route is required".into());
     }
@@ -173,8 +191,6 @@ pub fn resolve(config: &Config) -> Result<Resolved, ConfigError> {
             }
         })
         .collect();
-
-    check_shared_namespaces(&routes, &mut errors);
 
     if let Some(m) = &config.stores.moka {
         if m.max_size_mb == 0 {
@@ -205,43 +221,23 @@ pub fn resolve(config: &Config) -> Result<Resolved, ConfigError> {
     })
 }
 
-/// Routes that share a cache namespace (and at least one upstream) share
-/// entries, and an entry lives as long as the TTL of the route that stored
-/// it. So every method both routes cache there must have the same TTL.
-fn check_shared_namespaces(routes: &HashMap<String, Arc<RouteTable>>, errors: &mut Vec<String>) {
-    let mut sorted: Vec<(&String, &Arc<RouteTable>)> = routes.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    for (i, (name_a, a)) in sorted.iter().enumerate() {
-        for (name_b, b) in &sorted[i + 1..] {
-            // The plan for a method changes only at key boundaries, so these
-            // stand-ins reach every pair of keys the two routes can combine.
-            let mut probes: Vec<String> = vec!["\u{1}".to_owned()];
-            for t in [a, b] {
-                probes.extend(t.exact.keys().cloned());
-                probes.extend(t.prefixes.iter().map(|(p, _)| format!("{p}\u{1}")));
-            }
-            probes.sort();
-            probes.dedup();
-            let mut reported = std::collections::HashSet::new();
-            for m in &probes {
-                let (Some(pa), Some(pb)) = (a.accepted(m), b.accepted(m)) else { continue };
-                // Entries are per upstream: only a shared upstream shares them.
-                if !pa.selector.candidates().iter().any(|u| pb.selector.candidates().contains(u)) {
-                    continue;
-                }
-                let (Some(ca), Some(cb)) = (&pa.cache, &pb.cache) else { continue };
-                if ca.namespace != cb.namespace || ca.ttl == cb.ttl || !reported.insert(ca.namespace.clone()) {
-                    continue;
-                }
-                let method = m.trim_end_matches('\u{1}');
-                let method = if method.is_empty() { "*".to_owned() } else if method.len() < m.len() { format!("{method}*") } else { method.to_owned() };
-                errors.push(format!(
-                    "routes.{name_a} and routes.{name_b} share cache namespace `{}` but set different TTLs for `{method}` ({} ms and {} ms); \
-                     use the same TTL or separate namespaces",
-                    ca.namespace,
-                    ca.ttl.as_millis(),
-                    cb.ttl.as_millis()
-                ));
+/// Routes sharing a namespace share entries, and each reader judges an
+/// entry's age by its own TTL. An entry is kept as long as the longest TTL
+/// any method in its namespace uses, so a short TTL never cuts a long one.
+fn keep_for_the_longest_ttl(tables: &mut [RouteTable]) {
+    let mut longest: HashMap<String, Duration> = HashMap::new();
+    for t in tables.iter() {
+        for c in t.plans().filter_map(|p| p.cache.as_ref()) {
+            let keep = longest.entry(c.namespace.clone()).or_default();
+            *keep = (*keep).max(c.ttl);
+        }
+    }
+    for t in tables.iter_mut() {
+        for plan in t.plans_mut() {
+            // Not shared yet: resolution holds the only reference.
+            let p = Arc::get_mut(plan).expect("unshared during resolution");
+            if let Some(c) = &mut p.cache {
+                c.keep = longest[&c.namespace];
             }
         }
     }
@@ -326,6 +322,18 @@ fn resolve_route(
                     match_upstreams(&format!("{mpath}.upstreams"), u, names, errors)
                 });
                 let candidates = own.unwrap_or_else(|| candidates.clone());
+                match &glob {
+                    _ if over.cache.is_none() => {}
+                    Glob::Exact(m) if solana::is_write(m) => errors.push(format!(
+                        "{mpath}.cache: `{m}` is a write: a cached one is answered from the cache and never sent; \
+                         leave cache out"
+                    )),
+                    Glob::Exact(_) => {}
+                    _ => errors.push(format!(
+                        "{mpath}.cache: cache is set on exact method names only, since a TTL fits one method; \
+                         list the methods to cache"
+                    )),
+                }
                 let subscription = matches!(&glob, Glob::Exact(m) if solana::is_subscription_method(m));
                 if subscription {
                     if !over.has_no_policies() || !route.policies().has_no_policies() {
@@ -386,13 +394,13 @@ fn resolve_route(
         return None;
     }
     let table = RouteTable { name: route_name.to_owned(), upstreams: candidates, exact, prefixes, any, batch, batch_other };
-    warn_risky_writes(&table, warnings);
+    warn_quorum_writes(&table, warnings);
     Some(table)
 }
 
-/// Merge rules: unset fields inherit; `cache` and `retry` merge field by
-/// field; `upstreams`, `loadBalancing` and `mode` are replaced whole; `false`
-/// turns an inherited retry off.
+/// Merge rules: unset fields inherit; `retry` merges field by field;
+/// `upstreams`, `loadBalancing` and `mode` are replaced whole; `false` turns
+/// an inherited retry off. `cache` is never inherited: it is the method's own.
 pub fn merge(defaults: &Policies, over: &Policies) -> Policies {
     fn setting<T: Clone>(d: &Option<Setting<T>>, o: &Option<Setting<T>>, f: impl Fn(&T, &T) -> T) -> Option<Setting<T>> {
         match (d, o) {
@@ -405,14 +413,7 @@ pub fn merge(defaults: &Policies, over: &Policies) -> Policies {
     Policies {
         upstreams: over.upstreams.clone().or_else(|| defaults.upstreams.clone()),
         load_balancing: over.load_balancing.clone().or_else(|| defaults.load_balancing.clone()),
-        cache: match (&defaults.cache, &over.cache) {
-            (Some(d), Some(o)) => Some(Cache {
-                store: o.store.clone().or_else(|| d.store.clone()),
-                namespace: o.namespace.clone().or_else(|| d.namespace.clone()),
-                ttl: o.ttl.or(d.ttl),
-            }),
-            (d, o) => o.clone().or_else(|| d.clone()),
-        },
+        cache: over.cache.clone(),
         mode: over.mode.clone().or_else(|| defaults.mode.clone()),
         retry: setting(&defaults.retry, &over.retry, |d, o| Retry {
             attempts: o.attempts.or(d.attempts),
@@ -439,13 +440,19 @@ fn effective(
         None => None,
         Some(c) => match c.ttl {
             None => {
-                errors.push(format!("{mpath}: cache.ttl is required (set it here or in {rpath})"));
+                errors.push(format!("{mpath}: cache.ttl is required"));
                 None
             }
-            Some(0) => None,
+            Some(0) => {
+                errors.push(format!("{mpath}: cache.ttl must be at least 1 (leave cache out to not cache)"));
+                None
+            }
             Some(ttl) => Some(CachePolicy {
-                namespace: c.namespace.clone().unwrap_or_else(|| route_name.to_owned()),
+                namespace: c.namespace.clone().unwrap_or_default(),
                 ttl: Duration::from_millis(ttl),
+                // Set once every route is resolved.
+                keep: Duration::from_millis(ttl),
+                scope: route_name.to_owned(),
             }),
         },
     };
@@ -573,10 +580,10 @@ fn ranks_for(path: &str, order: &[String], candidates: &[UpstreamId], names: &[&
     ranks
 }
 
-/// Writes follow the configured policies like any other method, but a cache
-/// or quorum on one is almost never meant: both are allowed, with a warning
-/// at startup (`delta run` and `build()` alike).
-fn warn_risky_writes(t: &RouteTable, warnings: &mut Vec<String>) {
+/// Writes follow the configured policies like any other method, but quorum
+/// on one is almost never meant: it is allowed, with a warning at startup
+/// (`delta run` and `build()` alike).
+fn warn_quorum_writes(t: &RouteTable, warnings: &mut Vec<String>) {
     let mut methods: Vec<&str> = solana::KNOWN_WRITES.to_vec();
     methods.extend(t.exact.keys().map(String::as_str).filter(|m| solana::is_write(m)));
     methods.sort_unstable();
@@ -584,13 +591,6 @@ fn warn_risky_writes(t: &RouteTable, warnings: &mut Vec<String>) {
     let path = format!("routes.{}", t.name);
     for m in methods {
         let Some(p) = t.accepted(m) else { continue };
-        if let Some(c) = &p.cache {
-            warnings.push(format!(
-                "{path}: `{m}` is a write and is cached for {} ms: a repeat within that time gets the cached answer \
-                 and is never sent (set cache = {{ ttl = 0 }} on it)",
-                c.ttl.as_millis()
-            ));
-        }
         if matches!(p.mode, Mode::Quorum { .. }) {
             warnings.push(format!(
                 "{path}: `{m}` is a write under quorum: it is sent to every quorum member, and when one answers \
@@ -616,8 +616,7 @@ fn warn_unused_policies(path: &str, route: &Route, warnings: &mut Vec<String>) {
     }
     type Overrides = fn(&Policies) -> bool;
     // loadBalancing is left out: batches always use the route's.
-    let checks: [(&str, bool, Overrides); 3] = [
-        ("cache", d.cache.is_some(), |p| p.cache.as_ref().is_some_and(|c| c.ttl.is_some())),
+    let checks: [(&str, bool, Overrides); 2] = [
         ("mode", d.mode.is_some(), |p| p.mode.is_some()),
         ("retry", d.retry.is_some(), |p| p.retry.is_some()),
     ];
@@ -786,7 +785,7 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
         let any = safe.accepted("getBalance").unwrap();
         assert_eq!(any.mode, Mode::Quorum { threshold: 2, upstreams: 3 });
         assert_eq!(any.retry, once);
-        assert_eq!(any.cache.as_ref().unwrap().namespace, "verified");
+        assert_eq!(any.cache.as_ref().unwrap().ttl, Duration::from_millis(1000));
         let slot = safe.accepted("getSlot").unwrap();
         assert!(slot.cache.is_none());
         assert_eq!(slot.mode, Mode::Single);
@@ -801,7 +800,7 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
         assert_eq!(fast.upstreams.len(), 4);
         assert!(fast.lookup("getSlot").is_none());
         assert!(fast.accepted("getLatestBlockhash").unwrap().cache.is_none());
-        assert_eq!(fast.accepted("getBalance").unwrap().cache.as_ref().unwrap().namespace, "fast");
+        assert_eq!(fast.accepted("getBalance").unwrap().cache.as_ref().unwrap().namespace, "", "shared by default");
 
         let stream = &r.routes["stream"];
         assert!(stream.accepted("accountSubscribe").is_some());
@@ -931,7 +930,6 @@ getBlock           = { mode = { type = "single" }, retry = false }
             r#"
 [routes.stream]
 upstreams = ["helius"]
-cache = { ttl = 100 }
 retry = { attempts = 1, delay = 10 }
 [routes.stream.methods]
 accountSubscribe = {}
@@ -946,7 +944,6 @@ getSlot = { mode = { type = "single" } }
         .unwrap();
         let has = |s: &str| r.warnings.iter().any(|w| w.contains(s));
         assert!(has("ignored for subscription methods"), "{:?}", r.warnings);
-        assert!(has("routes.stream.cache: no accepted method uses it"), "{:?}", r.warnings);
         assert!(has("routes.stream.retry: no accepted method uses it"), "{:?}", r.warnings);
         assert!(has("routes.r.mode: no accepted method uses it"), "{:?}", r.warnings);
     }
@@ -964,25 +961,35 @@ getSlot = { mode = { type = "single" } }
     }
 
     #[test]
-    fn shared_namespaces_need_the_same_ttl() {
-        let two = |a: &str, b: &str| {
-            format!(
-                "[routes.a]\nupstreams = [\"helius\"]\ncache = {{ namespace = \"v\", ttl = 1000 }}\n[routes.a.methods]\n{a}\n\
-                 [routes.b]\nupstreams = [\"helius\"]\ncache = {{ namespace = \"v\", ttl = 1000 }}\n[routes.b.methods]\n{b}\n"
-            )
-        };
-        let e = err(&two("\"*\" = {}", "getBalance = { cache = { ttl = 2000 } }"));
-        assert!(e.contains("routes.a and routes.b share cache namespace `v`") && e.contains("getBalance") && e.contains("1000 ms and 2000 ms"), "{e}");
-        let e = err(&two("\"get*\" = {}", "getBalance = { cache = { ttl = 2000 } }"));
-        assert!(e.contains("getBalance"), "a glob on one side: {e}");
-        let e = err(&two("\"getB*\" = {}", "\"get*\" = {}\ngetBalance = { cache = { ttl = 2000 } }"));
-        assert!(e.contains("getBalance"), "prefixes of different length: {e}");
+    fn routes_share_the_cache_and_keep_entries_for_the_longest_ttl() {
+        let r = load(
+            r#"
+[routes.fast]
+upstreams = ["*"]
+[routes.fast.methods]
+getBalance = { cache = { ttl = 200 } }
 
-        load(&two("\"*\" = {}", "getBalance = {}")).unwrap();
-        load(&two("\"*\" = {}", "getBalance = { cache = { ttl = 0 } }")).expect("not cached on one side");
-        load(&two("\"*\" = {}", "getBalance = { cache = { ttl = 2000, namespace = \"w\" } }")).expect("another namespace");
-        let disjoint = two("\"*\" = {}", "getBalance = { cache = { ttl = 2000 } }").replacen("[\"helius\"]", "[\"triton\"]", 1);
-        load(&disjoint).expect("no upstream in common: no entry is ever shared");
+[routes.safe]
+upstreams = ["*"]
+[routes.safe.methods]
+getBalance = { cache = { ttl = 2000 } }
+getSlot    = { cache = { ttl = 5000 } }
+
+[routes.own]
+upstreams = ["*"]
+[routes.own.methods]
+getBalance = { cache = { namespace = "own", ttl = 100 } }
+"#,
+        )
+        .expect("different TTLs in one namespace load");
+        let c = |route: &str, m: &str| r.routes[route].accepted(m).unwrap().cache.clone().unwrap();
+        let ms = Duration::from_millis;
+        let fast = c("fast", "getBalance");
+        assert_eq!((fast.namespace.as_str(), fast.ttl, fast.keep), ("", ms(200), ms(5000)), "shared by default");
+        assert_eq!((c("safe", "getBalance").ttl, c("safe", "getBalance").keep), (ms(2000), ms(5000)));
+        assert_eq!(c("safe", "getBalance").scope, "safe", "in-flight misses are shared per route");
+        let own = c("own", "getBalance");
+        assert_eq!((own.namespace.as_str(), own.keep), ("own", ms(100)), "its own namespace, its own keep");
     }
 
     #[test]
@@ -1050,25 +1057,28 @@ accountSubscribe = { upstreams = ["helius"] }
     }
 
     #[test]
-    fn policies_sit_on_the_route_not_in_defaults() {
-        let e = err("[routes.r]\nupstreams = [\"*\"]\ndefaults = { cache = { ttl = 5 } }\n[routes.r.methods]\nx = {}\n");
-        assert!(e.contains("unknown field `defaults`"), "{e}");
-        let r = load("[routes.r]\nupstreams = [\"*\"]\ncache = { ttl = 5 }\n[routes.r.methods]\nx = {}\n").unwrap();
-        assert!(r.routes["r"].accepted("x").unwrap().cache.is_some(), "inherited from the route");
+    fn cache_is_set_on_exact_method_names_only() {
+        let e = err("[routes.r]\nupstreams = [\"*\"]\ncache = { ttl = 5 }\n[routes.r.methods]\nx = {}\n");
+        assert!(e.contains("unknown field `cache`"), "not on the route: {e}");
+        for key in ["\"*\"", "\"get*\""] {
+            let e = err(&format!("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\n{key} = {{ cache = {{ ttl = 5 }} }}\n"));
+            assert!(e.contains(".cache: cache is set on exact method names only"), "{key}: {e}");
+        }
+        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { cache = { ttl = 0 } }\n");
+        assert!(e.contains("cache.ttl must be at least 1 (leave cache out to not cache)"), "{e}");
+        for write in ["sendTransaction", "requestAirdrop", "sendBundle"] {
+            let e = err(&format!("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\n{write} = {{ cache = {{ ttl = 5 }} }}\n"));
+            assert!(e.contains(&format!("routes.r.methods.{write}.cache: `{write}` is a write")), "{e}");
+        }
+        let r = load("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\n\"*\" = {}\nx = { cache = { ttl = 5 } }\n").unwrap();
+        assert!(r.routes["r"].accepted("x").unwrap().cache.is_some());
+        assert!(r.routes["r"].accepted("y").unwrap().cache.is_none(), "nothing else is cached");
     }
 
     #[test]
-    fn cached_or_quorum_writes_load_with_a_warning() {
+    fn quorum_writes_load_with_a_warning() {
         let r = load(
             r#"
-[routes.c]
-upstreams = ["*"]
-cache = { ttl = 1000 }
-[routes.c.methods]
-"*" = {}
-sendBundle = {}
-requestAirdrop = { cache = { ttl = 0 } }
-
 [routes.q]
 upstreams = ["*"]
 mode = { type = "quorum", threshold = 2, upstreams = 2 }
@@ -1078,10 +1088,7 @@ mode = { type = "quorum", threshold = 2, upstreams = 2 }
         )
         .unwrap();
         let has = |s: &str| r.warnings.iter().any(|w| w.contains(s));
-        assert!(has("routes.c: `sendTransaction` is a write and is cached for 1000 ms"), "{:?}", r.warnings);
-        assert!(has("routes.c: `sendBundle` is a write and is cached"), "{:?}", r.warnings);
-        assert!(!has("`requestAirdrop` is a write and is cached"), "its cache is off: {:?}", r.warnings);
         assert!(has("routes.q: `sendTransaction` is a write under quorum"), "{:?}", r.warnings);
-        assert!(r.routes["c"].accepted("sendTransaction").unwrap().cache.is_some(), "still cached, as configured");
+        assert!(has("routes.q: `sendBundle` is a write under quorum"), "{:?}", r.warnings);
     }
 }

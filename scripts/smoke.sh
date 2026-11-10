@@ -170,10 +170,11 @@ expect "three different answers: refused (-33094)" "$(rpc "$(route safe)" getBal
 expect "getAccountInfo of the System Program: all three agree" \
   "$(rpc "$(route safe)" getAccountInfo "[\"$SYSTEM_PROGRAM\", {\"encoding\": \"base64\"}]")" '.result.value.executable == true'
 
-section "Cache (getLatestBlockhash only, 5 s per node, weighted 3:2:1)"
+section "Cache (getLatestBlockhash only, 5 s, weighted 3:2:1)"
 expect "getSlot is refused here (-32601)" "$(rpc "$(route cache)" getSlot)" '.error.code == -32601'
 # Uncached, the answer changes every slot (400 ms). Over 2 s of requests a
-# 5 s cache leaves at most one answer per node.
+# 5 s cache leaves one answer, whichever node it came from (two if the entry
+# an earlier check stored expires during the run).
 answers=""
 for _ in $(seq 1 20); do
   answers="$answers$(rpc "$(route cache)" getLatestBlockhash | jq -c '.result // empty')"$'\n'
@@ -181,10 +182,10 @@ for _ in $(seq 1 20); do
 done
 answered=$(printf '%s' "$answers" | grep -c .)
 distinct=$(printf '%s' "$answers" | sort -u | grep -c .)
-if [ "$answered" -eq 20 ] && [ "$distinct" -le 3 ]; then
-  ok "20 requests over 2 s got $distinct distinct answers: served from the cache (one entry per node)"
+if [ "$answered" -eq 20 ] && [ "$distinct" -le 2 ]; then
+  ok "20 requests over 2 s got $distinct distinct answers: served from the cache (one entry, not one per node)"
 else
-  bad "20 requests over 2 s, at most 3 distinct answers" "$answered answered, $distinct distinct"
+  bad "20 requests over 2 s, at most 2 distinct answers" "$answered answered, $distinct distinct"
 fi
 
 section "Failover (priority surf-a, surf-b, surf-c)"

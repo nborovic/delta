@@ -132,12 +132,12 @@ async fn notifications_run_but_get_no_response() {
 const MIXED: &str = r#"
 [routes.r]
 upstreams = ["*"]
-cache = { ttl = 60000 }
 loadBalancing = { type = "priority", order = ["u1", "u0"] }
 [routes.r.methods]
 "*" = {}
 getSlot = false
-getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, mode = { type = "quorum", threshold = 2, upstreams = 2 } }
+getLatestBlockhash = { cache = { ttl = 60000 } }
+getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, mode = { type = "quorum", threshold = 2, upstreams = 2 }, cache = { ttl = 60000 } }
 "#;
 
 #[tokio::test]
@@ -281,19 +281,18 @@ async fn method_keys_most_specific_wins() {
         r#"
 [routes.r]
 upstreams = ["*"]
-cache = { ttl = 60000 }
 [routes.r.methods]
 "*"          = false
-"get*"       = { cache = { ttl = 0 } }
+"get*"       = {}
 "getBlock*"  = false
 getBlockHeight = {}
-getBalance   = {}
+getBalance   = { cache = { ttl = 60000 } }
 getSlot      = false
 "#,
     )
     .await;
     let key = pubkey();
-    // exact key: accepted, cached (inherits the route's TTL)
+    // exact key: accepted, cached (its own TTL)
     for _ in 0..2 {
         result(&env.call("r", "getBalance", json!([key])).await);
     }

@@ -9,9 +9,9 @@ const ROUTES: &str = r#"
 [routes.fast]
 upstreams = ["*"]
 mode = { type = "hedge", upstreams = 2 }
-cache = { ttl = 60000 }
 [routes.fast.methods]
 "*" = {}
+getBalance = { cache = { ttl = 60000 } }
 
 [routes.safe]
 upstreams = ["*"]

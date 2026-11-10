@@ -104,12 +104,12 @@ async fn a_retried_send_after_a_lost_reply_lands_once() {
 #[tokio::test]
 #[ignore = "needs surfpool"]
 async fn a_send_is_exempted_from_route_policies_with_its_own_entry() {
-    // The route verifies and caches reads; the send turns both off, as the
-    // startup warning advises.
+    // The route verifies reads by quorum; the send turns it off, as the
+    // startup warning advises. Nothing is cached unless named.
     let env = env(
         &[0, 0],
-        "[routes.q]\nupstreams = [\"*\"]\nmode = { type = \"quorum\", threshold = 2, upstreams = 2 }\ncache = { ttl = 60000 }\n\
-         [routes.q.methods]\n\"*\" = {}\nsendTransaction = { mode = { type = \"single\" }, cache = { ttl = 0 } }\n",
+        "[routes.q]\nupstreams = [\"*\"]\nmode = { type = \"quorum\", threshold = 2, upstreams = 2 }\n\
+         [routes.q.methods]\n\"*\" = {}\nsendTransaction = { mode = { type = \"single\" } }\n",
     )
     .await;
     let chain = env.chain(0);
@@ -119,7 +119,7 @@ async fn a_send_is_exempted_from_route_policies_with_its_own_entry() {
     assert_eq!(result(&env.call("q", "sendTransaction", json!([tx, base64()])).await), &json!(sig));
     assert_eq!(env.total_calls("sendTransaction"), 1, "sent once, not to every quorum member");
     env.call("q", "sendTransaction", json!([tx, base64()])).await;
-    assert_eq!(env.total_calls("sendTransaction"), 2, "not answered from the cache");
+    assert_eq!(env.total_calls("sendTransaction"), 2, "never cached: not named with a cache");
     chain.wait_landed(&sig).await;
     assert_eq!(chain.balance(&to).await, 1_000_000);
 

@@ -90,15 +90,16 @@ async fn writes_are_sent_to_every_hedged_upstream() {
 
 #[tokio::test]
 #[ignore = "needs surfpool"]
-async fn hedged_calls_go_through_the_cache() {
-    let env = env(&[0, 0], &hedge_route(2, "cache = { ttl = 60000 }")).await;
+async fn a_cached_hedge_answers_without_racing() {
+    let toml = hedge_route(2, "").replace("\"*\" = {}", "getBalance = { cache = { ttl = 60000 } }");
+    let env = env(&[0, 0], &toml).await;
     let key = pubkey();
     env.call("h", "getBalance", json!([key])).await;
     assert!(eventually(ms(2000), || async { env.total_calls("getBalance") == 2 }).await);
     for _ in 0..3 {
         env.call("h", "getBalance", json!([key])).await;
     }
-    assert_eq!(env.calls("getBalance"), vec![1, 1], "both upstreams' entries are hits");
+    assert_eq!(env.calls("getBalance"), vec![1, 1], "one race, then hits that start no calls");
 }
 
 #[tokio::test]

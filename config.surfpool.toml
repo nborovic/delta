@@ -49,15 +49,14 @@ mode = { type = "quorum", threshold = 2, upstreams = 3 }
 getBalance     = {}
 getAccountInfo = {}
 
-# /rpc/cache: getLatestBlockhash only, cached for 5 s per node, with requests
+# /rpc/cache: getLatestBlockhash only, cached for 5 s, with the misses
 # spread 3:2:1 over the nodes.
 [routes.cache]
 upstreams = ["*"]
-cache = { ttl = 5000 }
 loadBalancing = { type = "weighted", weights = { surf-a = 3, surf-b = 2, surf-c = 1 } }
 
 [routes.cache.methods]
-getLatestBlockhash = {}
+getLatestBlockhash = { cache = { ttl = 5000 } }
 
 # /rpc/failover: every method on surf-a while it is healthy, then surf-b, then
 # surf-c. One node at a time, so a wallet or the Solana CLI sees one

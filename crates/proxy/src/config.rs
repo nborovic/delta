@@ -194,15 +194,14 @@ impl Upstream {
 }
 
 /// A route: its upstreams, the policies every method starts from, and the
-/// methods it accepts.
+/// methods it accepts. `cache` is not among them: it is set per exact
+/// method name, since a TTL fits one method.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Route {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub load_balancing: Option<LoadBalancing>,
-    #[serde(default)]
-    pub cache: Option<Cache>,
     #[serde(default)]
     pub mode: Option<Mode>,
     #[serde(default)]
@@ -215,7 +214,6 @@ impl Route {
         Route {
             upstreams: upstreams.into_iter().map(Into::into).collect(),
             load_balancing: None,
-            cache: None,
             mode: None,
             retry: None,
             methods: BTreeMap::new(),
@@ -226,17 +224,13 @@ impl Route {
         Policies {
             upstreams: None,
             load_balancing: self.load_balancing.clone(),
-            cache: self.cache.clone(),
+            cache: None,
             mode: self.mode.clone(),
             retry: self.retry.clone(),
         }
     }
     pub fn load_balancing(mut self, lb: LoadBalancing) -> Self {
         self.load_balancing = Some(lb);
-        self
-    }
-    pub fn cache(mut self, cache: Cache) -> Self {
-        self.cache = Some(cache);
         self
     }
     pub fn mode(mut self, mode: Mode) -> Self {
@@ -290,6 +284,7 @@ pub struct Policies {
     /// named, not only the route's.
     pub upstreams: Option<Vec<String>>,
     pub load_balancing: Option<LoadBalancing>,
+    /// Only on an exact method name; never inherited.
     pub cache: Option<Cache>,
     /// Replaces the route's mode whole.
     pub mode: Option<Mode>,
@@ -366,9 +361,10 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Setting<T> {
 pub struct Cache {
     /// Default: moka.
     pub store: Option<Store>,
-    /// Default: the route name.
+    /// Default: `""`, shared by every route. Routes in one namespace share
+    /// entries; each judges an entry's age by its own `ttl`.
     pub namespace: Option<String>,
-    /// Milliseconds; 0 = off.
+    /// Milliseconds, at least 1; required.
     pub ttl: Option<u64>,
 }
 

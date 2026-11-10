@@ -17,8 +17,16 @@ pub struct EffectivePolicies {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CachePolicy {
+    /// `""` = shared by every route.
     pub namespace: String,
+    /// How old an entry this method accepts.
     pub ttl: Duration,
+    /// How long a stored entry is kept: the longest TTL of any method
+    /// reading this namespace, so a short TTL never evicts for a long one.
+    pub keep: Duration,
+    /// Concurrent misses share one execution only within the same scope
+    /// (the route), where every request runs the same policies.
+    pub scope: String,
 }
 
 /// The upstream calls one attempt makes.

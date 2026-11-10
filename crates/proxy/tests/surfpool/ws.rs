@@ -8,9 +8,9 @@ use crate::harness::*;
 const STREAM: &str = r#"
 [routes.s]
 upstreams = ["*"]
-cache = { ttl = 60000 }
 [routes.s.methods]
 "*" = {}
+getBalance = { cache = { ttl = 60000 } }
 
 [routes.only0]
 upstreams = ["u0"]

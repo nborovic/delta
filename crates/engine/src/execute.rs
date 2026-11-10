@@ -1,20 +1,21 @@
-//! Policy execution: the mode (single, hedge or quorum) decides the upstream
-//! calls of one attempt, retry runs another attempt after a failed one, and
-//! each call goes through the cache, then the upstream.
+//! Policy execution: the cache answers first; on a miss, retry runs the
+//! attempts and the mode (single, hedge or quorum) decides each attempt's
+//! upstream calls. The request's final answer is what gets stored.
 //!
 //! Every upstream call runs in its own task. Hedge, quorum and client
 //! disconnects only stop waiting for a call; they never abort it, so every
 //! request the proxy starts is fully sent and still records health.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::cache::Cached;
@@ -22,7 +23,7 @@ use crate::health::Signal;
 use crate::jsonrpc::{self, Answer, RpcError};
 use crate::policy::{EffectivePolicies, Mode};
 use crate::shared::Shared;
-use crate::solana::{self, Finality};
+use crate::solana;
 use crate::upstream::{TransportError, UpstreamId};
 
 /// The outcome of one upstream call: a final answer (a result, or a JSON-RPC
@@ -81,59 +82,128 @@ impl std::fmt::Display for CacheUse {
 /// the client, with a trace of how it was produced.
 pub async fn execute(shared: &Arc<Shared>, policies: &EffectivePolicies, req: Request<'_>) -> (Answer, Trace) {
     let deadline = req.arrived + shared.limits.request_deadline;
-    // Code rule: data not known to be finalized is never cached for methods
-    // whose answer can still change until then. Everything else, writes
-    // included, follows the configured policies.
-    let finality = solana::finality(req.method, req.params);
-    let cache = match &policies.cache {
-        Some(c) if finality != Finality::Never => Some((c.namespace.clone(), c.ttl)),
-        _ => None,
-    };
     let ctx = Arc::new(CallCtx {
         shared: shared.clone(),
         method: req.method.to_owned(),
         body: jsonrpc::upstream_body(req.method, req.params),
-        params_hash: cache.as_ref().map(|_| solana::params_hash(req.params)),
-        cache,
-        finality,
         deadline,
         calls: AtomicU32::new(0),
     });
+    let trace = |answer: Answer, by: AnsweredBy, cache: CacheUse| {
+        let trace = Trace { upstream: by.map(|up| shared.name(up).to_owned()), cache, calls: ctx.calls.load(Ordering::Relaxed) };
+        (answer, trace)
+    };
+    let cache = match &policies.cache {
+        Some(c) => c,
+        _ => {
+            let (answer, by) = attempts(&ctx, policies).await;
+            return trace(answer, by, CacheUse::Off);
+        }
+    };
+
+    // One entry per request, keyed by how many upstreams stand behind the
+    // answer: a quorum's agreed answer never serves as a single upstream's,
+    // nor the other way round.
+    let agreed = match policies.mode {
+        Mode::Quorum { threshold, .. } => threshold,
+        Mode::Single | Mode::Hedge { .. } => 1,
+    };
+    let key = format!("{}|agreed:{agreed}|{}|{}", cache.namespace, req.method, solana::params_hash(req.params).to_hex());
+    if let Some(hit) = shared.cache.get(&key).await.filter(|c| c.fresh_for(cache.ttl)) {
+        return trace(Answer::Result(hit.body), None, CacheUse::Hit);
+    }
+
+    // Concurrent misses on the same route share one execution: the first
+    // runs it, the others wait for its answer, error or not.
+    let lead = match shared.flights.join(format!("{}|{key}", cache.scope)) {
+        Ok(lead) => Some(lead),
+        Err(mut flight) => loop {
+            if let Some((answer, by)) = flight.borrow_and_update().clone() {
+                return trace(answer, by, CacheUse::Hit);
+            }
+            // The leading request went away (client gone): run our own.
+            if flight.changed().await.is_err() {
+                break None;
+            }
+        },
+    };
     let (answer, by) = attempts(&ctx, policies).await;
-    let cache = match (&ctx.cache, by) {
-        (None, _) => CacheUse::Off,
-        (Some(_), Some((_, true))) => CacheUse::Hit,
-        (Some(_), _) => CacheUse::Miss,
-    };
-    let trace = Trace {
-        upstream: by.map(|(up, _)| shared.name(up).to_owned()),
-        cache,
-        calls: ctx.calls.load(Ordering::Relaxed),
-    };
-    (answer, trace)
+    if let Answer::Result(body) = &answer {
+        if storable(shared, body) {
+            let entry = Cached { body: body.clone(), fetched: Instant::now(), keep: cache.keep };
+            shared.cache.insert(key, entry).await;
+        }
+    }
+    if let Some(lead) = lead {
+        lead.land(answer.clone(), by);
+    }
+    trace(answer, by, CacheUse::Miss)
+}
+
+/// A flight's answer, once it lands.
+type Landing = watch::Receiver<Option<(Answer, AnsweredBy)>>;
+
+/// Requests whose identical miss is being answered right now.
+#[derive(Default)]
+pub(crate) struct Flights(Mutex<HashMap<String, Landing>>);
+
+impl Flights {
+    /// Leads the flight for `key`, or follows the one already running.
+    fn join(&self, key: String) -> Result<Lead<'_>, Landing> {
+        let mut flights = self.0.lock().unwrap();
+        if let Some(flight) = flights.get(&key) {
+            return Err(flight.clone());
+        }
+        let (tx, rx) = watch::channel(None);
+        flights.insert(key.clone(), rx);
+        Ok(Lead { flights: self, key, tx })
+    }
+}
+
+/// The request running a flight. Ends the flight when dropped: landed, or
+/// abandoned (its followers then run their own).
+struct Lead<'a> {
+    flights: &'a Flights,
+    key: String,
+    tx: watch::Sender<Option<(Answer, AnsweredBy)>>,
+}
+
+impl Lead<'_> {
+    fn land(self, answer: Answer, by: AnsweredBy) {
+        self.tx.send_replace(Some((answer, by)));
+    }
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        self.flights.0.lock().unwrap().remove(&self.key);
+    }
+}
+
+/// Code rules on what may be stored: null/empty and oversized results never
+/// are. Everything else is cached for the method's TTL: under Alpenglow,
+/// history is final once a node returns it, and what still changes (current
+/// state, ranges reaching the tip) is bounded by the TTL.
+fn storable(shared: &Shared, body: &Bytes) -> bool {
+    body.len() <= shared.limits.max_cached_bytes && !solana::is_empty_result(body)
 }
 
 struct CallCtx {
     shared: Arc<Shared>,
     method: String,
     body: Bytes,
-    cache: Option<(String, Duration)>,
-    params_hash: Option<blake3::Hash>,
-    finality: Finality,
     deadline: Instant,
     /// Upstream HTTP calls started for this request.
     calls: AtomicU32,
 }
 
-/// Who answered: the upstream, and whether the answer came from the cache.
-type AnsweredBy = Option<(UpstreamId, bool)>;
+/// The upstream whose answer was returned.
+type AnsweredBy = Option<UpstreamId>;
 
-/// A finished call: which upstream, its outcome, and whether that outcome
-/// came from the cache.
+/// A finished call: which upstream, and its outcome.
 struct Served {
     up: UpstreamId,
     result: CallResult,
-    from_cache: bool,
 }
 
 /// Tracks failures so the client gets the last upstream JSON-RPC error if
@@ -170,14 +240,14 @@ fn spawn_call(ctx: &Arc<CallCtx>, up: UpstreamId) -> impl std::future::Future<Ou
     // Counted against `up` right away, in the same step as the pick, and
     // until the call ends.
     let assigned = ctx.shared.assign(up);
-    let handle: JoinHandle<(CallResult, bool)> = tokio::spawn(async move {
+    let handle: JoinHandle<CallResult> = tokio::spawn(async move {
         let _assigned = assigned;
-        cached_call(task_ctx, up).await
+        raw_call(&task_ctx, up).await
     });
     async move {
         match handle.await {
-            Ok((result, from_cache)) => Served { up, result, from_cache },
-            Err(e) => Served { up, result: Err(Failure { reason: format!("internal: {e}"), rpc_error: None }), from_cache: false },
+            Ok(result) => Served { up, result },
+            Err(e) => Served { up, result: Err(Failure { reason: format!("internal: {e}"), rpc_error: None }) },
         }
     }
 }
@@ -237,7 +307,7 @@ async fn single(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, log: &mut Fail
             Attempt::Failed(None)
         }
         Ok(s) => match s.result {
-            Ok(answer) => Attempt::Answered(answer, Some((s.up, s.from_cache))),
+            Ok(answer) => Attempt::Answered(answer, Some(s.up)),
             Err(f) => {
                 log.add(f);
                 Attempt::Failed(None)
@@ -255,7 +325,7 @@ async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize, log: 
         log.add(Failure { reason: "no upstream available".into(), rpc_error: None });
     }
     let mut racing: FuturesUnordered<_> = picks.iter().map(|&up| spawn_call(ctx, up)).collect();
-    let mut first_final: Option<(RpcError, UpstreamId, bool)> = None;
+    let mut first_final: Option<(RpcError, UpstreamId)> = None;
     loop {
         match tokio::time::timeout_at(ctx.deadline.into(), racing.next()).await {
             Err(_) => {
@@ -264,16 +334,16 @@ async fn hedge(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, n: usize, log: 
             }
             Ok(None) => break,
             Ok(Some(s)) => match s.result {
-                Ok(Answer::Result(body)) => return Attempt::Answered(Answer::Result(body), Some((s.up, s.from_cache))),
+                Ok(Answer::Result(body)) => return Attempt::Answered(Answer::Result(body), Some(s.up)),
                 Ok(Answer::Error(e)) => {
-                    first_final.get_or_insert((e, s.up, s.from_cache));
+                    first_final.get_or_insert((e, s.up));
                 }
                 Err(f) => log.add(f),
             },
         }
     }
     match first_final {
-        Some((e, up, cached)) => Attempt::Answered(Answer::Error(e), Some((up, cached))),
+        Some((e, up)) => Attempt::Answered(Answer::Error(e), Some(up)),
         None => Attempt::Failed(None),
     }
 }
@@ -295,7 +365,7 @@ async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usi
             Ok(Some(s)) => s,
         };
         remaining -= 1;
-        let (up, from_cache) = (next.up, next.from_cache);
+        let up = next.up;
         if let Ok(answer) = next.result {
             let key = match &answer {
                 Answer::Result(body) => solana::quorum_hash(&ctx.method, body),
@@ -304,7 +374,7 @@ async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usi
             let count = groups.entry(key).or_default();
             *count += 1;
             if *count >= threshold {
-                return Attempt::Answered(answer, Some((up, from_cache)));
+                return Attempt::Answered(answer, Some(up));
             }
         }
         let best = groups.values().copied().max().unwrap_or(0);
@@ -312,49 +382,6 @@ async fn quorum(ctx: &Arc<CallCtx>, policies: &EffectivePolicies, threshold: usi
             return not_reached();
         }
     }
-}
-
-/// One upstream call through the cache (when on). The flag is true when the
-/// outcome came from the cache or from another request's identical call,
-/// rather than from a call this request made.
-async fn cached_call(ctx: Arc<CallCtx>, up: UpstreamId) -> (CallResult, bool) {
-    let (Some((namespace, ttl)), Some(hash)) = (ctx.cache.clone(), ctx.params_hash) else {
-        return (raw_call(&ctx, up).await, false);
-    };
-    let key = format!("{namespace}|{}|{}|{}", ctx.shared.name(up), ctx.method, hash.to_hex());
-    let fetch_ctx = ctx.clone();
-    let fetched = Arc::new(AtomicBool::new(false));
-    let fetched_here = fetched.clone();
-    let fetch = async move {
-        fetched_here.store(true, Ordering::Relaxed);
-        let result = raw_call(&fetch_ctx, up).await;
-        match &result {
-            Ok(Answer::Result(body)) => match cache_ttl(&fetch_ctx, body, ttl) {
-                Some(ttl) => Ok(Cached { body: body.clone(), ttl }),
-                None => Err(result),
-            },
-            _ => Err(result),
-        }
-    }
-    .boxed();
-    let outcome = match ctx.shared.cache.get_or_fetch(key, fetch).await {
-        Ok(body) => Ok(Answer::Result(body)),
-        Err(outcome) => outcome,
-    };
-    (outcome, !fetched.load(Ordering::Relaxed))
-}
-
-/// Code rules on what may be stored. The TTL is whatever the route
-/// configured; null/empty, oversized and not-yet-finalized results are never
-/// stored.
-fn cache_ttl(ctx: &CallCtx, body: &Bytes, configured: Duration) -> Option<Duration> {
-    if configured.is_zero() || body.len() > ctx.shared.limits.max_cached_bytes || solana::is_empty_result(body) {
-        return None;
-    }
-    if ctx.finality == Finality::IfStatusesFinalized && !solana::statuses_finalized(body) {
-        return None;
-    }
-    Some(configured)
 }
 
 /// One HTTP call to one upstream: classifies the outcome and records health.

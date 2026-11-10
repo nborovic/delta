@@ -59,48 +59,6 @@ pub fn is_state_subscription(method: &str) -> bool {
     matches!(method, "accountSubscribe" | "slotSubscribe" | "rootSubscribe" | "signatureSubscribe")
 }
 
-/// Whether a response may be cached, by what is known about its finality.
-/// The configured TTL decides how long; this decides whether at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Finality {
-    /// The method's answer may be cached whatever its commitment.
-    Any,
-    /// Not known to be finalized: never cached.
-    Never,
-    /// Cached only when every status in the response is `finalized`.
-    IfStatusesFinalized,
-}
-
-/// Methods whose answer can still change until it is finalized are cached
-/// only when it is known to be. For most of them only the request can say
-/// so: an explicit `commitment: "finalized"` (a missing one is not assumed
-/// to mean `finalized`). `getSignatureStatuses` says so in its response.
-/// `getBlockTime` takes no commitment and its response does not say, so it
-/// is never cached.
-pub fn finality(method: &str, params: Option<&Value>) -> Finality {
-    match method {
-        "getTransaction" | "getBlock" | "getBlocks" | "getBlocksWithLimit" | "getInflationReward" => {
-            if commitment(params) == Some("finalized") {
-                Finality::Any
-            } else {
-                Finality::Never
-            }
-        }
-        "getSignatureStatuses" => Finality::IfStatusesFinalized,
-        "getBlockTime" => Finality::Never,
-        _ => Finality::Any,
-    }
-}
-
-/// True when a `getSignatureStatuses` result lists only finalized statuses
-/// (no `null` entries).
-pub fn statuses_finalized(raw: &[u8]) -> bool {
-    let Ok(result) = serde_json::from_slice::<Value>(raw) else { return false };
-    let Some(statuses) = result.get("value").and_then(Value::as_array) else { return false };
-    !statuses.is_empty()
-        && statuses.iter().all(|s| s.get("confirmationStatus").and_then(Value::as_str) == Some("finalized"))
-}
-
 /// The commitment a request asked for, if any (the config object is the last
 /// positional parameter).
 pub fn commitment(params: Option<&Value>) -> Option<&str> {
@@ -227,30 +185,6 @@ mod tests {
         // Base58 case is preserved.
         assert_ne!(a, canonical_params(Some(&json!(["ABC"]))));
         assert_eq!(canonical_params(None), canonical_params(Some(&json!([]))));
-    }
-
-    #[test]
-    fn finality_rules() {
-        let fin = json!([1, {"commitment": "finalized"}]);
-        assert_eq!(finality("getTransaction", Some(&json!(["sig"]))), Finality::Never);
-        assert_eq!(finality("getTransaction", Some(&json!(["sig", {"commitment": "confirmed"}]))), Finality::Never);
-        assert_eq!(finality("getTransaction", Some(&json!(["sig", {"commitment": "finalized"}]))), Finality::Any);
-        assert_eq!(finality("getBlock", Some(&fin)), Finality::Any);
-        assert_eq!(finality("getBlock", Some(&json!([1]))), Finality::Never);
-        assert_eq!(finality("getBlockTime", Some(&json!([1]))), Finality::Never);
-        assert_eq!(finality("getSignatureStatuses", Some(&json!([["s"]]))), Finality::IfStatusesFinalized);
-        assert_eq!(finality("getBalance", Some(&json!(["a"]))), Finality::Any);
-    }
-
-    #[test]
-    fn statuses() {
-        let st = |c: &str| format!(r#"{{"slot":1,"confirmations":null,"err":null,"confirmationStatus":"{c}"}}"#);
-        let res = |v: String| format!(r#"{{"context":{{"slot":5}},"value":[{v}]}}"#);
-        assert!(statuses_finalized(res(st("finalized")).as_bytes()));
-        assert!(statuses_finalized(res(format!("{},{}", st("finalized"), st("finalized"))).as_bytes()));
-        assert!(!statuses_finalized(res(format!("{},{}", st("finalized"), st("confirmed"))).as_bytes()));
-        assert!(!statuses_finalized(res(format!("{},null", st("finalized"))).as_bytes()));
-        assert!(!statuses_finalized(res(String::new()).as_bytes()));
     }
 
     #[test]

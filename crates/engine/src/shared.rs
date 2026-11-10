@@ -8,6 +8,7 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::cache::CacheBackend;
+use crate::execute::Flights;
 use crate::health::Health;
 use crate::limits::Limits;
 use crate::upstream::{Transport, UpstreamId, UpstreamInfo};
@@ -17,6 +18,8 @@ pub struct Shared {
     pub health: Health,
     pub limits: Limits,
     pub cache: Arc<dyn CacheBackend>,
+    /// Cache misses being answered right now, shared by identical requests.
+    pub(crate) flights: Flights,
     pub transport: Arc<dyn Transport>,
     permits: Vec<Arc<Semaphore>>,
     /// Calls assigned to each upstream and not finished yet. Counted from
@@ -58,6 +61,7 @@ impl Shared {
             upstreams,
             limits,
             cache,
+            flights: Flights::default(),
             transport,
         })
     }

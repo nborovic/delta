@@ -14,8 +14,8 @@ pub fn proxy() -> Result<ProxyBuilder, ConfigError> {
         .api_key("local", ApiKey::new("11111111-2222-4333-8444-555555555555").routes(["*"]))
         .route(
             "cache",
-            Route::new(["*"]).load_balancing(LoadBalancing::weighted([("surf-a", 3), ("surf-b", 2), ("surf-c", 1)])).cache(Cache::ttl(5000))
-                .method("getLatestBlockhash", Policies::new())
+            Route::new(["*"]).load_balancing(LoadBalancing::weighted([("surf-a", 3), ("surf-b", 2), ("surf-c", 1)]))
+                .method("getLatestBlockhash", Policies::new().cache(Cache::ttl(5000)))
         )
         .route(
             "failover",

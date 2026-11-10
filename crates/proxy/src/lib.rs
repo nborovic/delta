@@ -15,8 +15,8 @@
 //!         .upstream("helius", Upstream::url(format!("https://mainnet.helius-rpc.com/?api-key={}", env("HELIUS_KEY")?)))
 //!         .api_key("backend", ApiKey::new(env("BACKEND_KEY")?).total_rps(500).routes(["*"]))
 //!         .route("fast", Route::new(["helius"])
-//!             .load_balancing(LoadBalancing::RoundRobin).cache(Cache::ttl(200)).mode(Mode::hedge(1))
-//!             .method("getAccountInfo", Policies::new()))
+//!             .load_balancing(LoadBalancing::RoundRobin).mode(Mode::hedge(1))
+//!             .method("getAccountInfo", Policies::new().cache(Cache::ttl(200))))
 //!         .build()?
 //!         .run()
 //!         .await
