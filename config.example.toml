@@ -78,7 +78,9 @@ mode = { type = "hedge", upstreams = 4 }
 [routes.send.methods]
 sendTransaction = {}
 
-# /stream: subscriptions on two upstreams
+# /stream: subscriptions on two upstreams. `single` (the default) runs on one
+# and moves to the other if it drops; `redundant` runs on both so no event is
+# missed, each notification forwarded once.
 [routes.stream]
 upstreams = ["helius", "own-1"]
 
@@ -87,7 +89,7 @@ accountSubscribe     = {}
 accountUnsubscribe   = {}
 slotSubscribe        = {}
 slotUnsubscribe      = {}
-logsSubscribe        = {}
+logsSubscribe        = { mode = { type = "redundant" } }
 logsUnsubscribe      = {}
 signatureSubscribe   = {}
 signatureUnsubscribe = {}

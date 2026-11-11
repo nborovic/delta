@@ -346,6 +346,7 @@ impl Gen {
         match &p.mode {
             None => {}
             Some(Mode::Single) => out.push_str(".mode(Mode::Single)"),
+            Some(Mode::Redundant) => out.push_str(".mode(Mode::Redundant)"),
             Some(Mode::Hedge { upstreams }) => write!(out, ".mode(Mode::hedge({upstreams}))").unwrap(),
             Some(Mode::Quorum { threshold, upstreams }) => write!(out, ".mode(Mode::quorum({threshold}, {upstreams}))").unwrap(),
         }

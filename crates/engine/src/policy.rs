@@ -38,6 +38,9 @@ pub enum Mode {
     Hedge { upstreams: usize },
     /// N upstreams; `threshold` matching answers answer.
     Quorum { threshold: usize, upstreams: usize },
+    /// Subscriptions only (resolve never gives it to a call): every upstream
+    /// at once, the first copy of each notification forwarded.
+    Redundant,
 }
 
 /// Runs the mode again after a failed attempt, whatever the mode.

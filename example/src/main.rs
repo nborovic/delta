@@ -36,13 +36,13 @@ pub fn proxy() -> Result<ProxyBuilder, ConfigError> {
         .route(
             "stream",
             Route::new(["*"])
-                .method("accountSubscribe", Policies::new())
+                .method("accountSubscribe", Policies::new().mode(Mode::Redundant))
                 .method("accountUnsubscribe", Policies::new())
-                .method("logsSubscribe", Policies::new())
+                .method("logsSubscribe", Policies::new().mode(Mode::Redundant))
                 .method("logsUnsubscribe", Policies::new())
-                .method("signatureSubscribe", Policies::new())
+                .method("signatureSubscribe", Policies::new().mode(Mode::Redundant))
                 .method("signatureUnsubscribe", Policies::new())
-                .method("slotSubscribe", Policies::new())
+                .method("slotSubscribe", Policies::new().mode(Mode::Redundant))
                 .method("slotUnsubscribe", Policies::new())
         )
     )

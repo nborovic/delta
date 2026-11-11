@@ -106,7 +106,7 @@ pub async fn execute(shared: &Arc<Shared>, policies: &EffectivePolicies, req: Re
     // nor the other way round.
     let agreed = match policies.mode {
         Mode::Quorum { threshold, .. } => threshold,
-        Mode::Single | Mode::Hedge { .. } => 1,
+        Mode::Single | Mode::Hedge { .. } | Mode::Redundant => 1,
     };
     let key = format!("{}|agreed:{agreed}|{}|{}", cache.namespace, req.method, solana::params_hash(req.params).to_hex());
     if let Some(hit) = shared.cache.get(&key).await.filter(|c| c.fresh_for(cache.ttl)) {
@@ -275,7 +275,8 @@ async fn attempts(ctx: &Arc<CallCtx>, policies: &EffectivePolicies) -> (Answer, 
             break;
         }
         let outcome = match &policies.mode {
-            Mode::Single => single(ctx, policies, &mut log).await,
+            // Redundant is for subscriptions; a call never has it.
+            Mode::Single | Mode::Redundant => single(ctx, policies, &mut log).await,
             Mode::Hedge { upstreams } => hedge(ctx, policies, *upstreams, &mut log).await,
             Mode::Quorum { threshold, upstreams } => quorum(ctx, policies, *threshold, *upstreams).await,
         };

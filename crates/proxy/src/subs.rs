@@ -1,7 +1,9 @@
 //! Subscription manager. Each upstream holds at most one subscription per
 //! `(method, canonical params)`, however many clients or routes ask for it.
-//! A client subscription is opened on every upstream its route lists; the
-//! first copy of each notification is forwarded.
+//! A `single` client subscription runs on one upstream at a time and moves
+//! to another when it drops or fails; a `redundant` one runs on every
+//! upstream of its method, and the first copy of each notification is
+//! forwarded.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -10,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use delta_engine::health::Signal;
 use delta_engine::jsonrpc::{self, canonical_json, Answer, RpcError};
+use delta_engine::policy::{EffectivePolicies, Mode};
 use delta_engine::{solana, Shared, UpstreamId};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -33,6 +36,10 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Minimum wait between reconnect attempts, on top of the health backoff.
 const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
+/// An upstream that refused a subscription still in use is asked again
+/// after this, doubling each time up to `RESUBSCRIBE_CAP`.
+const RESUBSCRIBE_BASE: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_CAP: Duration = Duration::from_secs(30);
 
 /// One client WebSocket connection, as the manager sees it.
 pub struct ConnHandle {
@@ -112,6 +119,8 @@ enum UpStatus {
 struct UpEntry {
     refs: usize,
     status: UpStatus,
+    /// Refusals in a row, for the resubscribe backoff.
+    refusals: u32,
 }
 
 struct KeyEntry {
@@ -127,7 +136,13 @@ struct ClientSub {
     key: SubKey,
     method: String,
     params: Option<Value>,
+    /// The method's policies: its mode and the selector over its upstreams.
+    plan: Arc<EffectivePolicies>,
+    /// The upstreams it runs on now: one for `single`, all for `redundant`.
     upstreams: Vec<UpstreamId>,
+    /// Upstreams a `single` subscription failed on since it last ran; not
+    /// tried again until it runs somewhere.
+    tried: Vec<UpstreamId>,
     waiter: Option<oneshot::Sender<Result<(), Answer>>>,
     /// Every upstream of this subscription was down at some point: data may
     /// have been missed.
@@ -244,13 +259,14 @@ impl Subscriptions {
         })
     }
 
-    /// Opens (or attaches to) a subscription on every one of `upstreams`
-    /// (the method's) and returns the proxy-issued id. `limit` is the owner
-    /// key's `maxSubscriptions`.
+    /// Opens (or attaches to) a subscription and returns the proxy-issued
+    /// id: on one upstream for `single` (trying the next when it fails), on
+    /// every one of the method's upstreams for `redundant`. `limit` is the
+    /// owner key's `maxSubscriptions`.
     pub async fn subscribe(
         &self,
         conn: &Arc<ConnHandle>,
-        upstreams: &[UpstreamId],
+        plan: &Arc<EffectivePolicies>,
         method: &str,
         params: Option<Value>,
         owner: KeyId,
@@ -258,9 +274,7 @@ impl Subscriptions {
     ) -> Answer {
         let key = SubKey::new(method, params.as_ref());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        let mut wants = Vec::new();
-        let immediate = {
+        {
             let mut st = self.state.lock().unwrap();
             let held = st.per_key.get(&owner).copied().unwrap_or(0);
             if let Some(max) = limit.filter(|&m| held >= m) {
@@ -276,16 +290,6 @@ impl Subscriptions {
                 clients: HashSet::new(),
             });
             entry.clients.insert(id);
-            for &up in upstreams {
-                let e = entry.ups.entry(up).or_insert(UpEntry { refs: 0, status: UpStatus::Pending });
-                e.refs += 1;
-                if e.refs == 1 {
-                    e.status = UpStatus::Pending;
-                    wants.push(up);
-                }
-            }
-            let statuses: Vec<UpStatus> = upstreams.iter().map(|u| entry.ups[u].status.clone()).collect();
-            let immediate = settle(&statuses);
             st.clients.insert(
                 id,
                 ClientSub {
@@ -293,9 +297,11 @@ impl Subscriptions {
                     owner,
                     key: key.clone(),
                     method: method.to_owned(),
-                    params: params.clone(),
-                    upstreams: upstreams.to_vec(),
-                    waiter: if immediate.is_none() { Some(tx) } else { None },
+                    params,
+                    plan: plan.clone(),
+                    upstreams: Vec::new(),
+                    tried: Vec::new(),
+                    waiter: None,
                     gap: false,
                     dedup: Dedup::new(solana::is_state_subscription(method)),
                     acked: false,
@@ -306,27 +312,152 @@ impl Subscriptions {
                     last_value: None,
                 },
             );
-            immediate
+        }
+        let single = plan.mode != Mode::Redundant;
+        let deadline = tokio::time::Instant::now() + SUBSCRIBE_TIMEOUT;
+        let mut ups = if single {
+            self.pick_single(&key, plan, &[]).into_iter().collect()
+        } else {
+            plan.selector.candidates().to_vec()
         };
-        for up in wants {
-            let placed = self.command(up, Cmd::Want { key: key.clone(), method: method.to_owned(), params: params.clone() });
+        let mut tried = Vec::new();
+        loop {
+            tried.extend_from_slice(&ups);
+            let (tx, rx) = oneshot::channel();
+            let outcome = match self.attach(id, &ups, Some(tx)) {
+                Some(r) => r,
+                None => match tokio::time::timeout_at(deadline, rx).await {
+                    Ok(Ok(r)) => r,
+                    _ => Err(Answer::error(jsonrpc::UPSTREAM_FAILED, "upstream failed: subscribe timed out")),
+                },
+            };
+            match outcome {
+                Ok(()) => return Answer::Result(id.to_string().into()),
+                Err(answer) => {
+                    let next = single && tokio::time::Instant::now() < deadline;
+                    if let Some(up) = next.then(|| self.pick_single(&key, plan, &tried)).flatten() {
+                        ups = vec![up];
+                        continue;
+                    }
+                    self.detach(id);
+                    return answer;
+                }
+            }
+        }
+    }
+
+    /// The upstream for a `single` subscription: one already holding the
+    /// same subscription (so identical subscriptions keep sharing it), else
+    /// the method's `loadBalancing` pick. `None` once every upstream is in
+    /// `exclude`.
+    fn pick_single(&self, key: &SubKey, plan: &EffectivePolicies, exclude: &[UpstreamId]) -> Option<UpstreamId> {
+        let candidates = plan.selector.candidates().iter().filter(|u| !exclude.contains(u));
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(entry) = st.keys.get(key) {
+                let holds = |up: &UpstreamId| {
+                    entry.ups.get(up).is_some_and(|e| matches!(e.status, UpStatus::Active | UpStatus::Pending))
+                };
+                if let Some(&up) = candidates.clone().find(|u| holds(u)) {
+                    return Some(up);
+                }
+            }
+        }
+        plan.selector.pick(&self.shared, &key.method, 1, exclude).first().copied()
+    }
+
+    /// Puts client subscription `id` on `ups`, in place of the upstreams it
+    /// ran on (a `single` one moving to another upstream). Returns the
+    /// outcome when it is already known; otherwise `waiter` hears it.
+    fn attach(&self, id: u64, ups: &[UpstreamId], waiter: Option<oneshot::Sender<Result<(), Answer>>>) -> Option<Result<(), Answer>> {
+        let gone = || Some(Err(Answer::error(jsonrpc::UPSTREAM_FAILED, "upstream failed: subscription closed")));
+        let (key, method, params, wants, unwants, immediate, recover) = {
+            let mut guard = self.state.lock().unwrap();
+            let st = &mut *guard;
+            let Some(client) = st.clients.get_mut(&id) else { return gone() };
+            let Some(entry) = st.keys.get_mut(&client.key) else { return gone() };
+            let old = std::mem::replace(&mut client.upstreams, ups.to_vec());
+            let mut unwants = Vec::new();
+            for up in old.iter().filter(|u| !ups.contains(u)) {
+                if let Some(e) = entry.ups.get_mut(up) {
+                    e.refs -= 1;
+                    if e.refs == 0 {
+                        entry.ups.remove(up);
+                        unwants.push(*up);
+                    }
+                }
+            }
+            let mut wants = Vec::new();
+            for &up in ups.iter().filter(|u| !old.contains(u)) {
+                let e = entry.ups.entry(up).or_insert(UpEntry { refs: 0, status: UpStatus::Pending, refusals: 0 });
+                e.refs += 1;
+                if e.refs == 1 {
+                    e.status = UpStatus::Pending;
+                    wants.push(up);
+                }
+            }
+            let statuses: Vec<UpStatus> = ups.iter().map(|u| entry.ups[u].status.clone()).collect();
+            let immediate = settle(&statuses);
+            if immediate.is_none() {
+                client.waiter = waiter;
+            }
+            // Moved onto a subscription already running: no confirmation
+            // will come to trigger gap recovery, so start it here.
+            let recover = client.gap && client.waiter.is_none() && matches!(immediate, Some(Ok(())));
+            if recover {
+                client.gap = false;
+                client.tried.clear();
+            }
+            (client.key.clone(), client.method.clone(), client.params.clone(), wants, unwants, immediate, recover)
+        };
+        for up in unwants {
+            self.command(up, Cmd::Unwant { key: key.clone() });
+        }
+        for &up in &wants {
+            let placed = self.command(up, Cmd::Want { key: key.clone(), method: method.clone(), params: params.clone() });
             if !placed {
                 let full = RpcError::new(jsonrpc::SUBSCRIPTION_LIMIT, "subscription limit reached: no upstream connection has room");
                 self.on_confirmed(up, &key, Err(full));
             }
         }
-        let outcome = match immediate {
-            Some(r) => r,
-            None => match tokio::time::timeout(SUBSCRIBE_TIMEOUT, rx).await {
-                Ok(Ok(r)) => r,
-                _ => Err(Answer::error(jsonrpc::UPSTREAM_FAILED, "upstream failed: subscribe timed out")),
-            },
-        };
-        match outcome {
-            Ok(()) => Answer::Result(id.to_string().into()),
-            Err(answer) => {
-                self.detach(id);
-                answer
+        if recover {
+            if let (Some(me), Some(&up)) = (self.me.upgrade(), ups.first()) {
+                tokio::spawn(async move { me.recover_gap(id, up).await });
+            }
+        }
+        immediate
+    }
+
+    /// `single` subscriptions whose upstream dropped or refused them move to
+    /// another upstream; gap recovery follows once they run there. With no
+    /// other upstream left, one whose upstream dropped waits for it to
+    /// reconnect; one refused everywhere closes the client.
+    fn failover(&self, moves: Vec<(u64, UpstreamId)>) {
+        for (cid, from) in moves {
+            let found = {
+                let mut st = self.state.lock().unwrap();
+                let Some(c) = st.clients.get_mut(&cid) else { continue };
+                if c.upstreams != [from] {
+                    continue;
+                }
+                if !c.tried.contains(&from) {
+                    c.tried.push(from);
+                }
+                (c.key.clone(), c.plan.clone(), c.tried.clone())
+            };
+            let (key, plan, tried) = found;
+            match self.pick_single(&key, &plan, &tried) {
+                Some(up) => {
+                    tracing::info!(method = %key.method, from = %self.shared.upstreams[from].name, to = %self.shared.upstreams[up].name, "subscription moved");
+                    self.attach(cid, &[up], None);
+                }
+                None => {
+                    let st = self.state.lock().unwrap();
+                    let refused = st.keys.get(&key).and_then(|e| e.ups.get(&from)).is_some_and(|e| matches!(e.status, UpStatus::Failed(_)));
+                    if let (true, Some(c)) = (refused, st.clients.get(&cid)) {
+                        c.conn.close(&format!("{} failed: no upstream took the subscription", key.method));
+                    }
+                }
             }
         }
     }
@@ -460,6 +591,8 @@ impl Subscriptions {
 
     fn on_confirmed(&self, up: UpstreamId, key: &SubKey, result: Result<(), RpcError>) {
         let mut recover = Vec::new();
+        let mut moves = Vec::new();
+        let retry_in;
         {
             let mut guard = self.state.lock().unwrap();
             let st = &mut *guard;
@@ -468,6 +601,18 @@ impl Subscriptions {
             ue.status = match &result {
                 Ok(()) => UpStatus::Active,
                 Err(e) => UpStatus::Failed(e.clone()),
+            };
+            // A refusal is asked again for as long as the subscription is
+            // held there; `resubscribe` checks that it still is.
+            retry_in = match &result {
+                Ok(()) => {
+                    ue.refusals = 0;
+                    None
+                }
+                Err(_) => {
+                    ue.refusals += 1;
+                    Some((ue.refusals, RESUBSCRIBE_BASE.saturating_mul(1 << (ue.refusals - 1).min(5)).min(RESUBSCRIBE_CAP)))
+                }
             };
             for cid in &entry.clients {
                 let Some(client) = st.clients.get_mut(cid) else { continue };
@@ -481,9 +626,17 @@ impl Subscriptions {
                         continue;
                     }
                 }
+                if result.is_ok() {
+                    client.tried.clear();
+                }
                 if result.is_ok() && client.gap && client.waiter.is_none() {
                     client.gap = false;
                     recover.push((*cid, up));
+                }
+                if result.is_err() && client.waiter.is_none() && client.plan.mode != Mode::Redundant {
+                    // Refused on resubscribe (after a reconnect or a move).
+                    client.gap = true;
+                    moves.push((*cid, up));
                 }
             }
         }
@@ -492,10 +645,53 @@ impl Subscriptions {
                 tokio::spawn(async move { me.recover_gap(cid, up).await });
             }
         }
+        self.failover(moves);
+        if let (Some((refusals, delay)), Err(e)) = (retry_in, &result) {
+            let name = &self.shared.upstreams[up].name;
+            let text = format!("subscription refused ({}); asking again in {} s", e.message, delay.as_secs());
+            // Once per run of refusals: an upstream that never takes it would
+            // otherwise log every 30 s.
+            if refusals == 1 {
+                tracing::warn!(upstream = %name, method = %key.method, "{text}");
+            } else {
+                tracing::debug!(upstream = %name, method = %key.method, "{text}");
+            }
+            if let Some(me) = self.me.upgrade() {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    me.resubscribe(up, &key);
+                });
+            }
+        }
+    }
+
+    /// Asks `up` again for a subscription it refused, if any client still
+    /// holds it there (a `redundant` one, or a `single` one with nowhere
+    /// else to go).
+    fn resubscribe(&self, up: UpstreamId, key: &SubKey) {
+        let params = {
+            let mut guard = self.state.lock().unwrap();
+            let st = &mut *guard;
+            let Some(entry) = st.keys.get_mut(key) else { return };
+            let Some(ue) = entry.ups.get_mut(&up) else { return };
+            if !matches!(ue.status, UpStatus::Failed(_)) {
+                return;
+            }
+            let Some(params) = entry.clients.iter().find_map(|c| st.clients.get(c)).map(|c| c.params.clone()) else { return };
+            ue.status = UpStatus::Pending;
+            params
+        };
+        let placed = self.command(up, Cmd::Want { key: key.clone(), method: key.method.clone(), params });
+        if !placed {
+            let full = RpcError::new(jsonrpc::SUBSCRIPTION_LIMIT, "subscription limit reached: no upstream connection has room");
+            self.on_confirmed(up, key, Err(full));
+        }
     }
 
     /// One connection to `up` dropped: the subscriptions it carried are down.
     fn on_down(&self, up: UpstreamId, carried: &[SubKey]) {
+        let mut moves = Vec::new();
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         for k in carried {
@@ -516,9 +712,14 @@ impl Subscriptions {
                     }
                 } else if !statuses.iter().any(|s| matches!(s, UpStatus::Active)) {
                     client.gap = true;
+                    if client.plan.mode != Mode::Redundant {
+                        moves.push((*cid, up));
+                    }
                 }
             }
         }
+        drop(guard);
+        self.failover(moves);
     }
 
     fn on_notification(&self, up: UpstreamId, key: &SubKey, result: &Value) {
@@ -987,7 +1188,14 @@ mod tests {
             key: SubKey::new(method, None),
             method: method.to_owned(),
             params: None,
+            plan: Arc::new(EffectivePolicies {
+                selector: delta_engine::selector::Selector::new(vec![0], delta_engine::selector::Strategy::RoundRobin),
+                cache: None,
+                mode: Mode::Single,
+                retry: None,
+            }),
             upstreams: vec![0],
+            tried: Vec::new(),
             waiter: None,
             gap: false,
             dedup: Dedup::default(),

@@ -159,7 +159,7 @@ async fn a_transfer_seen_through_one_websocket() {
 #[ignore = "needs surfpool"]
 async fn a_transfers_logs_arrive_once_from_two_nodes() {
     // Two upstreams on one chain both send the same logsNotification.
-    let env = env(&[0, 0], &route("s", "")).await;
+    let env = env(&[0, 0], &format!("{}logsSubscribe = {{ mode = {{ type = \"redundant\" }} }}\n", route("s", ""))).await;
     let chain = env.chain(0);
     let wallet = chain.funded_wallet(2 * ONE_SOL).await;
     let to = pubkey();

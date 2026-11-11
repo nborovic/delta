@@ -77,11 +77,11 @@ retry = { attempts = 5, delay = 50 }
 upstreams = ["*"]
 
 [routes.stream.methods]
-slotSubscribe        = {}
+slotSubscribe        = { mode = { type = "redundant" } }
 slotUnsubscribe      = {}
-accountSubscribe     = {}
+accountSubscribe     = { mode = { type = "redundant" } }
 accountUnsubscribe   = {}
-signatureSubscribe   = {}
+signatureSubscribe   = { mode = { type = "redundant" } }
 signatureUnsubscribe = {}
-logsSubscribe        = {}
+logsSubscribe        = { mode = { type = "redundant" } }
 logsUnsubscribe      = {}

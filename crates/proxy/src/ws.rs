@@ -216,9 +216,7 @@ async fn respond(
                 None => Answer::error(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
                 Some(_) if solana::is_unsubscribe(method) => app.subs.unsubscribe(conn, method, req.params.as_ref()),
                 Some(plan) => {
-                    // The method's own upstreams, or the route's.
-                    let upstreams = plan.selector.candidates();
-                    let answer = app.subs.subscribe(conn, upstreams, method, req.params.clone(), key, app.auth.max_subscriptions(key)).await;
+                    let answer = app.subs.subscribe(conn, plan, method, req.params.clone(), key, app.auth.max_subscriptions(key)).await;
                     if let Answer::Result(id) = &answer {
                         subscribed = std::str::from_utf8(id).ok().and_then(|s| s.parse().ok());
                     }

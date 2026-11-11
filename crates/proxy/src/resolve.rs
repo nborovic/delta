@@ -336,17 +336,25 @@ fn resolve_route(
                 }
                 let subscription = matches!(&glob, Glob::Exact(m) if solana::is_subscription_method(m));
                 if subscription {
-                    if !over.has_no_policies() || !route.policies().has_no_policies() {
-                        warnings.push(format!(
-                            "{mpath}: policies are ignored for subscription methods; subscriptions use every one of their upstreams"
-                        ));
+                    if over.cache.is_some() || over.retry.is_some() {
+                        warnings.push(format!("{mpath}: cache and retry are ignored for subscriptions"));
                     }
-                    // Subscriptions take no policies; a plain selector keeps the
-                    // table uniform and carries their upstreams.
+                    // A subscription's mode is its own: a route's or a glob's
+                    // mode is for calls and never reaches it.
+                    let mode = match &over.mode {
+                        None | Some(crate::config::Mode::Single) => Mode::Single,
+                        Some(crate::config::Mode::Redundant) => Mode::Redundant,
+                        Some(_) => {
+                            errors.push(format!("{mpath}.mode: a subscription is single or redundant"));
+                            continue;
+                        }
+                    };
+                    let merged = merge(&route.policies(), over);
+                    let strategy = strategy(&mpath, merged.load_balancing.clone(), &candidates, names, errors);
                     MethodPlan::Accept(Arc::new(EffectivePolicies {
-                        selector: Selector::new(candidates, Strategy::RoundRobin),
+                        selector: Selector::new(candidates, strategy),
                         cache: None,
-                        mode: Mode::Single,
+                        mode,
                         retry: None,
                     }))
                 } else {
@@ -461,6 +469,10 @@ fn effective(
     let from = if over.mode.is_none() && merged.mode.is_some() { format!(" (mode set in {rpath})") } else { String::new() };
     let mode = match merged.mode.clone().unwrap_or(crate::config::Mode::Single) {
         crate::config::Mode::Single => Mode::Single,
+        crate::config::Mode::Redundant => {
+            errors.push(format!("{mpath}: mode redundant is for subscriptions only{from}"));
+            Mode::Single
+        }
         crate::config::Mode::Hedge { upstreams: n } => {
             if n == 0 || n > matched {
                 errors.push(format!(
@@ -829,6 +841,44 @@ getBlockTime = false
     }
 
     #[test]
+    fn subscriptions_are_single_or_redundant_set_on_their_own_name() {
+        let r = load(
+            r#"
+[routes.r]
+upstreams = ["*"]
+mode = { type = "hedge", upstreams = 2 }
+[routes.r.methods]
+"*" = {}
+slotSubscribe = {}
+logsSubscribe = { mode = { type = "redundant" } }
+"#,
+        )
+        .unwrap();
+        let mode = |m: &str| r.routes["r"].accepted(m).unwrap().mode.clone();
+        assert_eq!(mode("slotSubscribe"), Mode::Single, "the route's hedge is for calls");
+        assert_eq!(mode("logsSubscribe"), Mode::Redundant);
+        assert_eq!(mode("getSlot"), Mode::Hedge { upstreams: 2 });
+
+        for (routes, expected) in [
+            (
+                "[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nslotSubscribe = { mode = { type = \"hedge\", upstreams = 2 } }\n",
+                "routes.r.methods.slotSubscribe.mode: a subscription is single or redundant",
+            ),
+            (
+                "[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\ngetSlot = { mode = { type = \"redundant\" } }\n",
+                "routes.r.methods.getSlot: mode redundant is for subscriptions only",
+            ),
+            (
+                "[routes.r]\nupstreams = [\"*\"]\nmode = { type = \"redundant\" }\n[routes.r.methods]\n\"*\" = {}\n",
+                "mode redundant is for subscriptions only (mode set in routes.r)",
+            ),
+        ] {
+            let e = err(routes);
+            assert!(e.contains(expected), "{e}");
+        }
+    }
+
+    #[test]
     fn mode_is_replaced_whole_and_retry_inherited_apart() {
         let r = load(
             r#"
@@ -932,7 +982,7 @@ getBlock           = { mode = { type = "single" }, retry = false }
 upstreams = ["helius"]
 retry = { attempts = 1, delay = 10 }
 [routes.stream.methods]
-accountSubscribe = {}
+accountSubscribe = { retry = { attempts = 1, delay = 10 } }
 
 [routes.r]
 upstreams = ["*"]
@@ -943,7 +993,7 @@ getSlot = { mode = { type = "single" } }
         )
         .unwrap();
         let has = |s: &str| r.warnings.iter().any(|w| w.contains(s));
-        assert!(has("ignored for subscription methods"), "{:?}", r.warnings);
+        assert!(has("routes.stream.methods.accountSubscribe: cache and retry are ignored for subscriptions"), "{:?}", r.warnings);
         assert!(has("routes.stream.retry: no accepted method uses it"), "{:?}", r.warnings);
         assert!(has("routes.r.mode: no accepted method uses it"), "{:?}", r.warnings);
     }

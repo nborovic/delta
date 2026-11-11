@@ -5,12 +5,25 @@ use serde_json::{json, Value};
 
 use crate::harness::*;
 
+/// `s`: every subscription redundant. `one`: every subscription single (the
+/// default).
 const STREAM: &str = r#"
 [routes.s]
 upstreams = ["*"]
 [routes.s.methods]
 "*" = {}
 getBalance = { cache = { ttl = 60000 } }
+accountSubscribe = { mode = { type = "redundant" } }
+logsSubscribe = { mode = { type = "redundant" } }
+programSubscribe = { mode = { type = "redundant" } }
+rootSubscribe = { mode = { type = "redundant" } }
+signatureSubscribe = { mode = { type = "redundant" } }
+slotSubscribe = { mode = { type = "redundant" } }
+
+[routes.one]
+upstreams = ["*"]
+[routes.one.methods]
+"*" = {}
 
 [routes.only0]
 upstreams = ["u0"]
@@ -673,3 +686,98 @@ async fn an_idle_close_releases_only_that_clients_share_of_a_subscription() {
     assert!(eventually(ms(3000), || async { env.ws[0].count("accountUnsubscribe") == 1 }).await);
 }
 
+/// Which of two upstreams holds `method` (sent it a subscribe).
+fn holder(env: &Env, method: &str) -> usize {
+    match (env.ws[0].count(method), env.ws[1].count(method)) {
+        (1, 0) => 0,
+        (0, 1) => 1,
+        counts => panic!("expected one upstream subscription, got {counts:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_single_subscription_runs_on_one_upstream_shared_by_clients() {
+    let env = env(&[0, 0], STREAM).await;
+    let mut a = env.ws("one").await;
+    let mut b = env.ws("one").await;
+    a.subscribe("slotSubscribe", json!(null)).await;
+    b.subscribe("slotSubscribe", json!(null)).await;
+    holder(&env, "slotSubscribe");
+    for ws in [&mut a, &mut b] {
+        let s = slots(&ws.notifications_for(ms(1000)).await);
+        assert!(s.len() >= 4 && s.windows(2).all(|w| w[0] < w[1]), "{s:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_single_subscription_moves_when_its_upstream_drops() {
+    let env = env(&[0, 0], STREAM).await;
+    let mut ws = env.ws("one").await;
+    ws.subscribe("slotSubscribe", json!(null)).await;
+    ws.notifications_for(ms(500)).await;
+    let from = holder(&env, "slotSubscribe");
+    env.ws[from].refuse(true);
+    env.ws[from].cut();
+    assert!(eventually(ms(5000), || async { env.ws[1 - from].count("slotSubscribe") == 1 }).await, "moved to the other upstream");
+    ws.notifications_for(ms(300)).await;
+    let s = slots(&ws.notifications_for(ms(1000)).await);
+    assert!(s.len() >= 4 && s.windows(2).all(|w| w[0] < w[1]), "notifications go on: {s:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_single_subscribe_tries_the_next_upstream_when_one_is_down() {
+    let env = env(&[0, 0], STREAM).await;
+    env.ws[0].refuse(true);
+    // Round robin points some of these at u0 first.
+    for _ in 0..4 {
+        let mut ws = env.ws("one").await;
+        ws.subscribe("accountSubscribe", json!([pubkey(), {"encoding": "base64"}])).await;
+    }
+    assert_eq!(env.ws[1].count("accountSubscribe"), 4, "every one landed on u1");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_single_event_stream_is_closed_after_moving() {
+    // Events sent while it moved are lost: the client is told.
+    let env = env(&[0, 0], STREAM).await;
+    let mut ws = env.ws("one").await;
+    ws.subscribe("logsSubscribe", json!(["all"])).await;
+    let from = holder(&env, "logsSubscribe");
+    env.ws[from].refuse(true);
+    env.ws[from].cut();
+    let reason = ws.closed(ms(10_000)).await.expect("closed so the client knows it missed events");
+    assert!(reason.contains("logsSubscribe") && reason.contains("gap"), "{reason}");
+    assert_eq!(env.ws[1 - from].count("logsSubscribe"), 1, "it moved first");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_redundant_subscription_asks_a_refusing_upstream_again() {
+    // One subscription per upstream: u1 is full when the redundant one
+    // arrives, so it runs on u0 alone until u1 has room.
+    let routes = format!("{STREAM}\n[routes.only1]\nupstreams = [\"u1\"]\n[routes.only1.methods]\n\"*\" = {{}}\n");
+    let env = env_upstreams(&[0, 0], "", "maxSubscriptionsPerConnection = 1, maxConnections = 1", &routes, fast_limits()).await;
+    let account = |k: &str| json!([k, {"encoding": "base64", "commitment": "confirmed"}]);
+    let mut filler = env.ws("only1").await;
+    let held = filler.subscribe("accountSubscribe", account(&pubkey())).await;
+
+    let key = pubkey();
+    let mut ws = env.ws("s").await;
+    let id = ws.subscribe("accountSubscribe", account(&key)).await;
+    assert_eq!((env.ws[0].count("accountSubscribe"), env.ws[1].count("accountSubscribe")), (1, 1), "u1 had no room");
+
+    assert_eq!(result(&filler.call("accountUnsubscribe", json!([held])).await), true);
+    assert!(
+        eventually(ms(10_000), || async { env.ws[1].count("accountSubscribe") == 2 }).await,
+        "u1 was asked again once it had room"
+    );
+    // Both upstreams now carry it; the change arrives once.
+    result(&env.call("s", "requestAirdrop", json!([key, ONE])).await);
+    let n = ws.notification(ms(10_000)).await.expect("notification");
+    assert_eq!(n["params"]["subscription"], id);
+    assert!(ws.notifications_for(ms(1000)).await.is_empty(), "once, though two upstreams sent it");
+}
