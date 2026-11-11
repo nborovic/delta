@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use delta_engine::jsonrpc::{self, Answer};
 use delta_engine::{solana, Trace};
@@ -38,6 +38,11 @@ pub async fn serve(app: Arc<App>, ws: HyperWebsocket, route: Option<Arc<RouteTab
     tracing::info!(target: "delta::access", via = %who.via, key = %who.key, ip = %who.ip, route = %who.route, event = "websocket opened");
 
     let write_timeout = app.shared.limits.client_write_timeout;
+    // Last traffic either way, in ms since `opened`: the idle timeout counts
+    // from it.
+    let activity = Arc::new(AtomicU64::new(0));
+    let touch = move |activity: &AtomicU64| activity.store(opened.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let written = activity.clone();
     let writer = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -77,7 +82,7 @@ pub async fn serve(app: Arc<App>, ws: HyperWebsocket, route: Option<Arc<RouteTab
                     };
                     // A client that stops reading is closed, not buffered for.
                     match tokio::time::timeout(write_timeout, sink.send(Message::Text(text.into()))).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => touch(&written),
                         _ => break,
                     }
                 }
@@ -97,14 +102,24 @@ pub async fn serve(app: Arc<App>, ws: HyperWebsocket, route: Option<Arc<RouteTab
                 break;
             }
         };
+        let idle = app.shared.limits.ws_idle_timeout;
         let msg = tokio::select! {
             m = source.next() => m,
             _ = shutdown.wait_for(|down| *down) => {
                 conn.close("server shutting down");
                 break;
             }
+            _ = idle_for(&activity, opened, idle) => {
+                conn.close(&format!(
+                    "idle for {} s: send a message or a ping to keep the connection open",
+                    idle.as_secs()
+                ));
+                break;
+            }
         };
         let Some(msg) = msg else { break };
+        // Any frame keeps the connection alive, protocol pings and pongs too.
+        touch(&activity);
         let text = match msg {
             Ok(Message::Text(t)) => t.as_str().to_owned(),
             Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
@@ -112,9 +127,14 @@ pub async fn serve(app: Arc<App>, ws: HyperWebsocket, route: Option<Arc<RouteTab
             // Pings are answered by the WebSocket layer.
             Ok(_) => continue,
         };
+        let body = Body::parse(text.as_bytes());
+        // A client's keep-alive is the proxy's business: no upstream call, no
+        // rate-limit charge, no log line, and no reply (a notification).
+        if body.is_keepalive() {
+            continue;
+        }
         let arrived = Instant::now();
         messages += 1;
-        let body = Body::parse(text.as_bytes());
         if !app.auth.take(key, who.ip, body.count()) {
             log_refused(&who.via, &who.key, who.ip, &format!("/rpc/{}", who.route), 429, "rate limited");
             // No HTTP status over an open WebSocket: the message's response
@@ -222,4 +242,16 @@ fn rate_limited(body: &Body) -> Option<String> {
         Body::Invalid(_) => Some(err.to_response(&jsonrpc::null_id())),
     };
     out.map(|o| String::from_utf8(o).unwrap_or_default())
+}
+
+/// Resolves once the connection has had no traffic for `idle`.
+async fn idle_for(activity: &AtomicU64, opened: Instant, idle: Duration) {
+    loop {
+        let last = opened + Duration::from_millis(activity.load(Ordering::Relaxed));
+        let deadline = last + idle;
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline.into()).await;
+    }
 }

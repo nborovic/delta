@@ -25,6 +25,11 @@ pub struct Limits {
     /// Messages one client WebSocket may have in flight (received and not
     /// yet answered); past it delta stops reading from that client.
     pub ws_in_flight: usize,
+    /// A client WebSocket with no traffic either way (no message or ping
+    /// from the client, nothing sent to it) for this long is closed. Clients
+    /// keep connections alive as with RPC providers: web3.js and
+    /// @solana/kit send a JSON-RPC `ping` every 5 s.
+    pub ws_idle_timeout: Duration,
     /// How long shutdown waits for open requests before exiting anyway.
     pub shutdown_grace: Duration,
     pub health: HealthLimits,
@@ -61,6 +66,7 @@ impl Default for Limits {
             client_read_timeout: Duration::from_secs(10),
             client_write_timeout: Duration::from_secs(30),
             ws_in_flight: 256,
+            ws_idle_timeout: Duration::from_secs(600),
             shutdown_grace: Duration::from_secs(10),
             health: HealthLimits::default(),
         }

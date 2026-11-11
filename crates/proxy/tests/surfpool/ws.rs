@@ -562,3 +562,100 @@ async fn a_websocket_has_a_bounded_number_of_messages_in_flight() {
     assert_eq!(env.http[0].peak(), 2, "never more than 2 of this client's messages in flight");
 }
 
+
+/// The keep-alive web3.js and @solana/kit send every 5 s.
+const KEEPALIVE: &str = r#"{"jsonrpc":"2.0","method":"ping"}"#;
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn keepalive_pings_are_answered_by_delta() {
+    let key = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let env = env(&[0], &format!("{STREAM}\n[apiKeys.k]\nkey = \"{key}\"\nroutes = [\"*\"]\ntotalRps = 2\n")).await;
+    let mut ws = Ws::connect(&format!("{}?api-key={key}", env.ws_url("s"))).await;
+    for _ in 0..10 {
+        ws.send_raw(KEEPALIVE).await;
+    }
+    assert!(result(&ws.call("getSlot", Value::Null).await).is_u64(), "pings are not charged: the call still fits totalRps = 2");
+    ws.notifications_for(ms(200)).await;
+    let responses = ws.received.iter().filter(|m| m.get("id").is_some()).count();
+    assert_eq!(responses, 1, "nothing answers a ping: {:?}", ws.received);
+    assert_eq!(env.http[0].calls("ping"), 0, "never sent upstream, though the route accepts \"*\"");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn a_ping_with_an_id_is_a_normal_request() {
+    let env = env(&[0], STREAM).await;
+    let mut ws = env.ws("s").await;
+    let v = ws.call("ping", Value::Null).await;
+    assert!(v.get("result").is_some() || v.get("error").is_some(), "answered: {v}");
+    assert_eq!(env.http[0].calls("ping"), 1, "forwarded like any method");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn an_idle_connection_is_closed() {
+    let mut limits = fast_limits();
+    limits.ws_idle_timeout = ms(800);
+    let env = env_with(&[0], STREAM, limits).await;
+    let mut ws = env.ws("only0").await;
+    let reason = ws.closed(ms(3000)).await.expect("closed after 800 ms without traffic");
+    assert!(reason.contains("idle") && reason.contains("ping"), "{reason}");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn keepalives_and_notifications_keep_a_connection_open() {
+    let mut limits = fast_limits();
+    limits.ws_idle_timeout = ms(800);
+    let env = env_with(&[0], STREAM, limits).await;
+
+    let mut pinging = env.ws("only0").await;
+    for _ in 0..5 {
+        pinging.send_raw(KEEPALIVE).await;
+        tokio::time::sleep(ms(300)).await;
+    }
+    assert!(result(&pinging.call("getSlot", Value::Null).await).is_u64(), "open after 1.5 s of pings");
+
+    let mut subscribed = env.ws("only0").await;
+    subscribed.subscribe("slotSubscribe", json!([])).await;
+    assert!(subscribed.closed(ms(2000)).await.is_none(), "slot notifications keep it busy");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
+async fn an_idle_close_releases_only_that_clients_share_of_a_subscription() {
+    let mut limits = fast_limits();
+    limits.ws_idle_timeout = ms(800);
+    let env = env_with(&[0], STREAM, limits).await;
+    let key = pubkey();
+    let params = json!([key, {"encoding": "base64", "commitment": "confirmed"}]);
+    let mut quiet = env.ws("only0").await;
+    let mut alive = env.ws("only0").await;
+    quiet.subscribe("accountSubscribe", params.clone()).await;
+    let id = alive.subscribe("accountSubscribe", params).await;
+    assert_eq!(env.ws[0].count("accountSubscribe"), 1, "one upstream subscription, shared");
+
+    // `alive` keeps pinging; `quiet` sends nothing and its account never changes.
+    let reason = loop {
+        alive.send_raw(KEEPALIVE).await;
+        if let Some(reason) = quiet.closed(ms(300)).await {
+            break reason;
+        }
+    };
+    assert!(reason.contains("idle"), "{reason}");
+    for _ in 0..3 {
+        alive.send_raw(KEEPALIVE).await;
+        tokio::time::sleep(ms(200)).await;
+    }
+    assert_eq!(env.ws[0].count("accountUnsubscribe"), 0, "the other client still holds it");
+
+    result(&env.call("only0", "requestAirdrop", json!([key, 1_000_000_000])).await);
+    let n = alive.notification(ms(10_000)).await.expect("still notified");
+    assert_eq!(n["params"]["subscription"], id);
+
+    // Once the last holder goes idle too, the upstream subscription goes.
+    assert!(alive.closed(ms(3000)).await.is_some());
+    assert!(eventually(ms(3000), || async { env.ws[0].count("accountUnsubscribe") == 1 }).await);
+}
+

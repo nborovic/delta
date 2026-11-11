@@ -144,6 +144,13 @@ impl Body {
         }
     }
 
+    /// `{"jsonrpc":"2.0","method":"ping"}`: the keep-alive web3.js and
+    /// @solana/kit send every 5 s over WebSockets. A notification (no `id`),
+    /// so nothing answers it; a `ping` with an `id` is a normal request.
+    pub fn is_keepalive(&self) -> bool {
+        matches!(self, Body::Single(r) if r.id.is_none() && r.method.as_deref().is_ok_and(|m| m == "ping"))
+    }
+
     /// Requests this body counts against `totalRps` and `rpmPerIp`.
     pub fn count(&self) -> u32 {
         match self {
