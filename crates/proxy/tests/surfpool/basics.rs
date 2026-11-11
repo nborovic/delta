@@ -323,6 +323,14 @@ async fn subscriptions_need_a_websocket() {
 
 #[tokio::test]
 #[ignore = "needs surfpool"]
+async fn an_unknown_subscribe_over_http_is_a_call() {
+    let env = env(&[0], ALL).await;
+    env.call("r", "fooSubscribe", json!(null)).await;
+    assert_eq!(env.http[0].calls("fooSubscribe"), 1, "forwarded like any method");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
 async fn upstream_errors_pass_through_unretried() {
     let env = env(
         &[0],

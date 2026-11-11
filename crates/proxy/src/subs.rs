@@ -356,12 +356,12 @@ impl Subscriptions {
     /// `<x>Unsubscribe [id]`: detaches the client's subscription.
     pub fn unsubscribe(&self, conn: &ConnHandle, method: &str, params: Option<&Value>) -> Answer {
         let id = params.and_then(|p| p.get(0)).and_then(Value::as_u64);
-        let expected = solana::subscribe_for_unsubscribe(method);
+        let expected = solana::subscription_ended_by(method).map(|s| s.subscribe);
         let owned = id.is_some_and(|id| {
             let st = self.state.lock().unwrap();
             st.clients
                 .get(&id)
-                .is_some_and(|c| c.conn.id == conn.id && Some(&c.method) == expected.as_ref())
+                .is_some_and(|c| c.conn.id == conn.id && Some(c.method.as_str()) == expected)
         });
         match id {
             Some(id) if owned => {
@@ -701,7 +701,7 @@ fn send_or_hold(client: &mut ClientSub, id: u64, result_raw: &str) -> bool {
 fn deliver(client: &ClientSub, id: u64, result_raw: &str) {
     let text = format!(
         r#"{{"jsonrpc":"2.0","method":"{}","params":{{"result":{},"subscription":{}}}}}"#,
-        solana::notification_for(&client.method),
+        solana::subscription(&client.method).map_or("", |s| s.notification),
         result_raw,
         id
     );
@@ -827,10 +827,10 @@ async fn run_upstream(
                                 let Some((method, _)) = wanted.remove(&key) else { continue };
                                 if let Some(sub_id) = by_key.remove(&key) {
                                     active.remove(&sub_id);
-                                    let unsub = method.replace("Subscribe", "Unsubscribe");
+                                    let unsub = solana::subscription(&method).map_or("", |s| s.unsubscribe);
                                     let id = next_req;
                                     next_req += 1;
-                                    let text = request(id, &unsub, Some(&json!([sub_id])));
+                                    let text = request(id, unsub, Some(&json!([sub_id])));
                                     if sink.send(Message::Text(text.into())).await.is_err() { break "send failed".into(); }
                                 }
                                 // A subscribe still pending is unsubscribed when its
@@ -864,10 +864,10 @@ async fn run_upstream(
                                     subs.on_confirmed(up, &key, Ok(()));
                                 } else {
                                     // Unwanted while pending: close it upstream.
-                                    let unsub = key.method.replace("Subscribe", "Unsubscribe");
+                                    let unsub = solana::subscription(&key.method).map_or("", |s| s.unsubscribe);
                                     let id = next_req;
                                     next_req += 1;
-                                    let text = request(id, &unsub, Some(&json!([sub_id])));
+                                    let text = request(id, unsub, Some(&json!([sub_id])));
                                     if sink.send(Message::Text(text.into())).await.is_err() { break "send failed".into(); }
                                 }
                             }

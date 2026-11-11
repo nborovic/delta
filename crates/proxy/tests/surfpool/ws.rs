@@ -115,6 +115,20 @@ getLatestBlockhash = {}
 
 #[tokio::test]
 #[ignore = "needs surfpool"]
+async fn an_unknown_subscribe_is_forwarded_as_a_call() {
+    // Only known subscriptions are delta's own; a name ending in Subscribe
+    // is not enough.
+    let env = env(&[0], STREAM).await;
+    let mut ws = env.ws("s").await;
+    for method in ["fooSubscribe", "fooUnsubscribe"] {
+        ws.call(method, json!([1])).await;
+        assert_eq!(env.http[0].calls(method), 1, "{method} went to the upstream over HTTP");
+    }
+    assert!(env.ws[0].sent_methods().is_empty(), "nothing went over an upstream WebSocket");
+}
+
+#[tokio::test]
+#[ignore = "needs surfpool"]
 async fn slot_subscription_is_deduplicated_across_upstreams_and_clients() {
     let env = env(&[0, 0], STREAM).await;
     let mut a = env.ws("s").await;

@@ -27,36 +27,59 @@ pub fn is_retryable_rpc_error(code: i64) -> bool {
 /// only JSON-RPC error that counts against health.
 pub const NODE_UNHEALTHY: i64 = -32005;
 
-pub fn is_subscribe(method: &str) -> bool {
-    method.ends_with("Subscribe")
+/// A subscription delta manages itself: its three method names, and whether
+/// its notifications carry the latest state (only the newest one matters) or
+/// are an event stream where every message counts.
+pub struct Subscription {
+    pub subscribe: &'static str,
+    pub unsubscribe: &'static str,
+    pub notification: &'static str,
+    pub state: bool,
+}
+
+const fn sub(subscribe: &'static str, unsubscribe: &'static str, notification: &'static str, state: bool) -> Subscription {
+    Subscription { subscribe, unsubscribe, notification, state }
+}
+
+/// The only subscriptions: Agave's PubSub methods and `transactionSubscribe`
+/// (Triton's Whirligig, Helius, QuickNode). Any other method is a call,
+/// whatever its name: a vendor `fooSubscribe` is forwarded like `getSlot`.
+/// `programSubscribe` is an event stream: each notification is a different
+/// account, so keeping only the newest would lose the others.
+pub const SUBSCRIPTIONS: [Subscription; 10] = [
+    sub("accountSubscribe", "accountUnsubscribe", "accountNotification", true),
+    sub("blockSubscribe", "blockUnsubscribe", "blockNotification", false),
+    sub("logsSubscribe", "logsUnsubscribe", "logsNotification", false),
+    sub("programSubscribe", "programUnsubscribe", "programNotification", false),
+    sub("rootSubscribe", "rootUnsubscribe", "rootNotification", true),
+    sub("signatureSubscribe", "signatureUnsubscribe", "signatureNotification", true),
+    sub("slotSubscribe", "slotUnsubscribe", "slotNotification", true),
+    sub("slotsUpdatesSubscribe", "slotsUpdatesUnsubscribe", "slotsUpdatesNotification", false),
+    sub("voteSubscribe", "voteUnsubscribe", "voteNotification", false),
+    sub("transactionSubscribe", "transactionUnsubscribe", "transactionNotification", false),
+];
+
+/// The subscription `method` starts.
+pub fn subscription(method: &str) -> Option<&'static Subscription> {
+    SUBSCRIPTIONS.iter().find(|s| s.subscribe == method)
+}
+
+/// The subscription `method` ends.
+pub fn subscription_ended_by(method: &str) -> Option<&'static Subscription> {
+    SUBSCRIPTIONS.iter().find(|s| s.unsubscribe == method)
 }
 
 pub fn is_unsubscribe(method: &str) -> bool {
-    method.ends_with("Unsubscribe")
+    subscription_ended_by(method).is_some()
 }
 
 /// Subscription methods (subscribe or unsubscribe) take no policies.
 pub fn is_subscription_method(method: &str) -> bool {
-    is_subscribe(method) || is_unsubscribe(method)
+    subscription(method).is_some() || is_unsubscribe(method)
 }
 
-/// `accountUnsubscribe` -> `accountSubscribe`.
-pub fn subscribe_for_unsubscribe(method: &str) -> Option<String> {
-    method.strip_suffix("Unsubscribe").map(|base| format!("{base}Subscribe"))
-}
-
-/// `accountSubscribe` -> `accountNotification`.
-pub fn notification_for(method: &str) -> String {
-    let base = method.strip_suffix("Subscribe").unwrap_or(method);
-    format!("{base}Notification")
-}
-
-/// Subscriptions whose notifications carry the latest state (only the newest
-/// one matters), as opposed to event streams where every message counts.
-/// `programSubscribe` is an event stream: each notification is a different
-/// account, so keeping only the newest would lose the others.
 pub fn is_state_subscription(method: &str) -> bool {
-    matches!(method, "accountSubscribe" | "slotSubscribe" | "rootSubscribe" | "signatureSubscribe")
+    subscription(method).is_some_and(|s| s.state)
 }
 
 /// The commitment a request asked for, if any (the config object is the last
@@ -194,6 +217,15 @@ mod tests {
         assert!(is_empty_result(br#"{"context":{"slot":1},"value":null}"#));
         assert!(!is_empty_result(br#"{"context":{"slot":1},"value":{"lamports":1}}"#));
         assert!(!is_empty_result(b"42"));
+    }
+
+    #[test]
+    fn only_known_methods_are_subscriptions() {
+        assert!(is_subscription_method("accountSubscribe") && is_subscription_method("accountUnsubscribe"));
+        assert!(is_subscription_method("transactionSubscribe"));
+        assert!(!is_subscription_method("fooSubscribe") && !is_subscription_method("fooUnsubscribe"));
+        assert_eq!(subscription_ended_by("slotUnsubscribe").map(|s| s.subscribe), Some("slotSubscribe"));
+        assert!(is_state_subscription("accountSubscribe") && !is_state_subscription("programSubscribe"));
     }
 
     #[test]
