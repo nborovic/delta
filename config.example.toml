@@ -30,7 +30,7 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
 # /fast: race providers for low-latency reads
 [routes.fast]
 upstreams = ["helius", "triton", "own-*"]
-mode = { type = "hedge", upstreams = 2 }
+mode = { type = "hedge", fanout = 2 }
 
 [routes.fast.methods]
 getLatestBlockhash  = {}
@@ -41,7 +41,7 @@ getMultipleAccounts = { cache = { ttl = 200 } }
 # /safe: reads verified by quorum, asked again once when the nodes disagree
 [routes.safe]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 3 }
+mode = { type = "quorum", threshold = 2, fanout = 3 }
 retry = { attempts = 1, delay = 200 }
 
 [routes.safe.methods]
@@ -54,7 +54,7 @@ getBalance          = { cache = { ttl = 1000 } }
 getAccountInfo      = { cache = { ttl = 1000 } }
 getBlock            = { cache = { ttl = 86400000 }, loadBalancing = { type = "priority", order = ["own-*", "helius"] } }
 getTransaction      = { cache = { ttl = 86400000 } }
-getLatestBlockhash  = { mode = { type = "hedge", upstreams = 2 } }
+getLatestBlockhash  = { mode = { type = "hedge", fanout = 2 } }
 getSlot             = { mode = { type = "single" }, retry = { attempts = 3, delay = 50 } }
 getProgramAccounts  = { mode = { type = "single" }, retry = { attempts = 3, delay = 50 } }
 
@@ -73,7 +73,7 @@ getSlot                 = {}
 # /send: transactions to 4 upstreams
 [routes.send]
 upstreams = ["*"]
-mode = { type = "hedge", upstreams = 4 }
+mode = { type = "hedge", fanout = 4 }
 
 [routes.send.methods]
 sendTransaction = {}

@@ -11,7 +11,7 @@ fn quorum_route(threshold: usize, n: usize) -> String {
         r#"
 [routes.q]
 upstreams = ["*"]
-mode = {{ type = "quorum", threshold = {threshold}, upstreams = {n} }}
+mode = {{ type = "quorum", threshold = {threshold}, fanout = {n} }}
 loadBalancing = {{ type = "round-robin" }}
 [routes.q.methods]
 "*" = {{}}

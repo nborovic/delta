@@ -137,7 +137,7 @@ loadBalancing = { type = "priority", order = ["u1", "u0"] }
 "*" = {}
 getSlot = false
 getLatestBlockhash = { cache = { ttl = 60000 } }
-getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, mode = { type = "quorum", threshold = 2, upstreams = 2 }, cache = { ttl = 60000 } }
+getBalance = { loadBalancing = { type = "priority", order = ["u0", "u1"] }, mode = { type = "quorum", threshold = 2, fanout = 2 }, cache = { ttl = 60000 } }
 "#;
 
 #[tokio::test]

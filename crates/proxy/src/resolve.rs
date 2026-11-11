@@ -473,21 +473,21 @@ fn effective(
             errors.push(format!("{mpath}: mode redundant is for subscriptions only{from}"));
             Mode::Single
         }
-        crate::config::Mode::Hedge { upstreams: n } => {
+        crate::config::Mode::Hedge { fanout: n } => {
             if n == 0 || n > matched {
                 errors.push(format!(
-                    "{mpath}: hedge needs 1 <= upstreams ({n}) <= the {matched} upstreams this method uses{from}"
+                    "{mpath}: hedge needs 1 <= fanout ({n}) <= the {matched} upstreams this method uses{from}"
                 ));
             }
-            Mode::Hedge { upstreams: n }
+            Mode::Hedge { fanout: n }
         }
-        crate::config::Mode::Quorum { threshold: t, upstreams: n } => {
+        crate::config::Mode::Quorum { threshold: t, fanout: n } => {
             if t == 0 || t > n || n > matched {
                 errors.push(format!(
-                    "{mpath}: quorum needs 1 <= threshold ({t}) <= upstreams ({n}) <= the {matched} upstreams this method uses{from}"
+                    "{mpath}: quorum needs 1 <= threshold ({t}) <= fanout ({n}) <= the {matched} upstreams this method uses{from}"
                 ));
             }
-            Mode::Quorum { threshold: t, upstreams: n }
+            Mode::Quorum { threshold: t, fanout: n }
         }
     };
     let mut retry = None;
@@ -795,7 +795,7 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
         assert!(matches!(safe.lookup("sendTransaction"), Some(MethodPlan::Reject)));
         let once = Some(RetryPolicy { attempts: 1, delay: Duration::from_millis(200) });
         let any = safe.accepted("getBalance").unwrap();
-        assert_eq!(any.mode, Mode::Quorum { threshold: 2, upstreams: 3 });
+        assert_eq!(any.mode, Mode::Quorum { threshold: 2, fanout: 3 });
         assert_eq!(any.retry, once);
         assert_eq!(any.cache.as_ref().unwrap().ttl, Duration::from_millis(1000));
         let slot = safe.accepted("getSlot").unwrap();
@@ -803,7 +803,7 @@ own-2  = { http = "http://10.0.0.12:8899", ws = "ws://10.0.0.12:8900" }
         assert_eq!(slot.mode, Mode::Single);
         assert_eq!(slot.retry, Some(RetryPolicy { attempts: 3, delay: Duration::from_millis(50) }));
         let bh = safe.accepted("getLatestBlockhash").unwrap();
-        assert_eq!(bh.mode, Mode::Hedge { upstreams: 2 });
+        assert_eq!(bh.mode, Mode::Hedge { fanout: 2 });
         assert_eq!(bh.retry, once, "a method's own mode keeps the route's retry");
         let block = safe.accepted("getBlock").unwrap();
         assert_eq!(block.cache.as_ref().unwrap().ttl, Duration::from_millis(86_400_000));
@@ -846,7 +846,7 @@ getBlockTime = false
             r#"
 [routes.r]
 upstreams = ["*"]
-mode = { type = "hedge", upstreams = 2 }
+mode = { type = "hedge", fanout = 2 }
 [routes.r.methods]
 "*" = {}
 slotSubscribe = {}
@@ -857,11 +857,11 @@ logsSubscribe = { mode = { type = "redundant" } }
         let mode = |m: &str| r.routes["r"].accepted(m).unwrap().mode.clone();
         assert_eq!(mode("slotSubscribe"), Mode::Single, "the route's hedge is for calls");
         assert_eq!(mode("logsSubscribe"), Mode::Redundant);
-        assert_eq!(mode("getSlot"), Mode::Hedge { upstreams: 2 });
+        assert_eq!(mode("getSlot"), Mode::Hedge { fanout: 2 });
 
         for (routes, expected) in [
             (
-                "[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nslotSubscribe = { mode = { type = \"hedge\", upstreams = 2 } }\n",
+                "[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nslotSubscribe = { mode = { type = \"hedge\", fanout = 2 } }\n",
                 "routes.r.methods.slotSubscribe.mode: a subscription is single or redundant",
             ),
             (
@@ -884,12 +884,12 @@ logsSubscribe = { mode = { type = "redundant" } }
             r#"
 [routes.r]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 3 }
+mode = { type = "quorum", threshold = 2, fanout = 3 }
 retry = { attempts = 3, delay = 50 }
 [routes.r.methods]
 getBalance         = {}
 getSlot            = { retry = { attempts = 5 } }
-getLatestBlockhash = { mode = { type = "hedge", upstreams = 2 } }
+getLatestBlockhash = { mode = { type = "hedge", fanout = 2 } }
 getBlock           = { mode = { type = "single" }, retry = false }
 "#,
         )
@@ -897,11 +897,11 @@ getBlock           = { mode = { type = "single" }, retry = false }
         let t = &r.routes["r"];
         let retry = |attempts| Some(RetryPolicy { attempts, delay: Duration::from_millis(50) });
         let p = t.accepted("getBalance").unwrap();
-        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, upstreams: 3 }, &retry(3)));
+        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, fanout: 3 }, &retry(3)));
         let p = t.accepted("getSlot").unwrap();
-        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, upstreams: 3 }, &retry(5)));
+        assert_eq!((&p.mode, &p.retry), (&Mode::Quorum { threshold: 2, fanout: 3 }, &retry(5)));
         let p = t.accepted("getLatestBlockhash").unwrap();
-        assert_eq!((&p.mode, &p.retry), (&Mode::Hedge { upstreams: 2 }, &retry(3)));
+        assert_eq!((&p.mode, &p.retry), (&Mode::Hedge { fanout: 2 }, &retry(3)));
         let p = t.accepted("getBlock").unwrap();
         assert_eq!((&p.mode, &p.retry), (&Mode::Single, &None));
 
@@ -924,9 +924,9 @@ getBlock           = { mode = { type = "single" }, retry = false }
             ("[routes.r]\nupstreams = [\"own-9\"]\n[routes.r.methods]\nx = {}\n", "`own-9` matches no upstream"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\n\"*Subscribe\" = {}\n", "a method key is"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = false\n", "must accept at least one method"),
-            ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { mode = { type = \"quorum\", threshold = 2, upstreams = 3 } }\n", "quorum needs 1 <= threshold (2) <= upstreams (3) <= the 2 upstreams"),
-            ("[routes.r]\nupstreams = [\"own-1\"]\n[routes.r.methods]\nx = { mode = { type = \"hedge\", upstreams = 2 } }\n", "x: hedge needs 1 <= upstreams (2) <= the 1 upstreams this method uses"),
-            ("[routes.r]\nupstreams = [\"own-1\"]\nmode = { type = \"hedge\", upstreams = 0 }\n[routes.r.methods]\nx = {}\n", "(mode set in routes.r)"),
+            ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { mode = { type = \"quorum\", threshold = 2, fanout = 3 } }\n", "quorum needs 1 <= threshold (2) <= fanout (3) <= the 2 upstreams"),
+            ("[routes.r]\nupstreams = [\"own-1\"]\n[routes.r.methods]\nx = { mode = { type = \"hedge\", fanout = 2 } }\n", "x: hedge needs 1 <= fanout (2) <= the 1 upstreams this method uses"),
+            ("[routes.r]\nupstreams = [\"own-1\"]\nmode = { type = \"hedge\", fanout = 0 }\n[routes.r.methods]\nx = {}\n", "(mode set in routes.r)"),
             ("[routes.r]\nupstreams = [\"own-*\"]\n[routes.r.methods]\nx = { loadBalancing = { type = \"priority\", order = [\"triton\"] } }\n", "order entry `triton`"),
             ("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { loadBalancing = { type = \"weighted\", weights = { helius = 0 } } }\n", "weights.helius must be at least 1"),
             ("[routes.r]\nupstreams = [\"*\"]\n", "methods"),
@@ -986,7 +986,7 @@ accountSubscribe = { retry = { attempts = 1, delay = 10 } }
 
 [routes.r]
 upstreams = ["*"]
-mode = { type = "hedge", upstreams = 2 }
+mode = { type = "hedge", fanout = 2 }
 [routes.r.methods]
 getSlot = { mode = { type = "single" } }
 "#,
@@ -1082,7 +1082,7 @@ getBalance = { cache = { namespace = "own", ttl = 100 } }
             r#"
 [routes.r]
 upstreams = ["own-*"]
-mode = { type = "quorum", threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, fanout = 2 }
 [routes.r.methods]
 getSlot = {}
 getBalance = { upstreams = ["helius", "triton"], loadBalancing = { type = "priority", order = ["triton"] } }
@@ -1102,7 +1102,7 @@ accountSubscribe = { upstreams = ["helius"] }
         assert!(e.contains("routes.r.methods.x.upstreams: `nope` matches no upstream"), "{e}");
         assert!(e.contains("routes.r.methods.y.upstreams: at least one upstream is required"), "{e}");
         // Counted against the method's own upstreams.
-        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { upstreams = [\"helius\"], mode = { type = \"hedge\", upstreams = 2 } }\n");
+        let e = err("[routes.r]\nupstreams = [\"*\"]\n[routes.r.methods]\nx = { upstreams = [\"helius\"], mode = { type = \"hedge\", fanout = 2 } }\n");
         assert!(e.contains("<= the 1 upstreams this method uses"), "{e}");
     }
 
@@ -1131,7 +1131,7 @@ accountSubscribe = { upstreams = ["helius"] }
             r#"
 [routes.q]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, fanout = 2 }
 [routes.q.methods]
 "send*" = {}
 "#,

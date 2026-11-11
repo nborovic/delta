@@ -190,8 +190,8 @@ loadBalancing = {{ type = "round-robin" }}
     )
 }
 
-const HEDGE_2: &str = r#"{ type = "hedge", upstreams = 2 }"#;
-const QUORUM_2_OF_2: &str = r#"{ type = "quorum", threshold = 2, upstreams = 2 }"#;
+const HEDGE_2: &str = r#"{ type = "hedge", fanout = 2 }"#;
+const QUORUM_2_OF_2: &str = r#"{ type = "quorum", threshold = 2, fanout = 2 }"#;
 
 #[tokio::test]
 #[ignore = "needs surfpool"]
@@ -268,11 +268,11 @@ async fn a_method_with_its_own_mode_keeps_the_routes_retry() {
         r#"
 [routes.r]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, fanout = 2 }
 retry = { attempts = 1, delay = 0 }
 loadBalancing = { type = "round-robin" }
 [routes.r.methods]
-getLatestBlockhash = { mode = { type = "hedge", upstreams = 2 } }
+getLatestBlockhash = { mode = { type = "hedge", fanout = 2 } }
 "#,
     )
     .await;

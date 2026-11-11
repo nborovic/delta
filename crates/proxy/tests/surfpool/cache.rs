@@ -162,7 +162,7 @@ async fn a_quorum_stores_the_agreed_answer_apart_from_single_answers() {
         r#"
 [routes.q]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 2 }
+mode = { type = "quorum", threshold = 2, fanout = 2 }
 [routes.q.methods]
 getBalance = { cache = { ttl = 60000 } }
 

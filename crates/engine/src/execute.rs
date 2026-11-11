@@ -277,8 +277,8 @@ async fn attempts(ctx: &Arc<CallCtx>, policies: &EffectivePolicies) -> (Answer, 
         let outcome = match &policies.mode {
             // Redundant is for subscriptions; a call never has it.
             Mode::Single | Mode::Redundant => single(ctx, policies, &mut log).await,
-            Mode::Hedge { upstreams } => hedge(ctx, policies, *upstreams, &mut log).await,
-            Mode::Quorum { threshold, upstreams } => quorum(ctx, policies, *threshold, *upstreams).await,
+            Mode::Hedge { fanout } => hedge(ctx, policies, *fanout, &mut log).await,
+            Mode::Quorum { threshold, fanout } => quorum(ctx, policies, *threshold, *fanout).await,
         };
         match outcome {
             Attempt::Answered(answer, by) => return (answer, by),

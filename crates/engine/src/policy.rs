@@ -34,10 +34,10 @@ pub struct CachePolicy {
 pub enum Mode {
     /// One upstream.
     Single,
-    /// N upstreams at once; the first success answers.
-    Hedge { upstreams: usize },
-    /// N upstreams; `threshold` matching answers answer.
-    Quorum { threshold: usize, upstreams: usize },
+    /// `fanout` upstreams at once; the first success answers.
+    Hedge { fanout: usize },
+    /// `fanout` upstreams; `threshold` matching answers answer.
+    Quorum { threshold: usize, fanout: usize },
     /// Subscriptions only (resolve never gives it to a call): every upstream
     /// at once, the first copy of each notification forwarded.
     Redundant,

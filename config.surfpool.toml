@@ -35,7 +35,7 @@ surf-c = { http = "http://127.0.0.1:9099", ws = "ws://127.0.0.1:9100" }
 # wins. A write goes to both, and never reaches surf-c.
 [routes.hedge]
 upstreams = ["surf-a", "surf-b"]
-mode = { type = "hedge", upstreams = 2 }
+mode = { type = "hedge", fanout = 2 }
 
 [routes.hedge.methods]
 "*" = {}
@@ -43,7 +43,7 @@ mode = { type = "hedge", upstreams = 2 }
 # /rpc/safe: all three nodes are asked; an answer needs two that agree.
 [routes.safe]
 upstreams = ["*"]
-mode = { type = "quorum", threshold = 2, upstreams = 3 }
+mode = { type = "quorum", threshold = 2, fanout = 3 }
 
 [routes.safe.methods]
 getBalance     = {}

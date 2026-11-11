@@ -11,7 +11,7 @@ fn hedge_route(n: usize, extra: &str) -> String {
         r#"
 [routes.h]
 upstreams = ["*"]
-mode = {{ type = "hedge", upstreams = {n} }}
+mode = {{ type = "hedge", fanout = {n} }}
 loadBalancing = {{ type = "round-robin" }}
 {extra}
 [routes.h.methods]

@@ -409,28 +409,29 @@ impl Retry {
 }
 
 /// The upstream calls one attempt makes: `{ type = "single" }`,
-/// `{ type = "hedge", upstreams }` or `{ type = "quorum", threshold, upstreams }`.
+/// `{ type = "hedge", fanout }` or `{ type = "quorum", threshold, fanout }`.
+/// `fanout` is how many of the method's upstreams one attempt asks.
 /// A subscription is `single` or `{ type = "redundant" }`, set on its own
 /// method name.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     /// One upstream, picked by `loadBalancing`. The default.
     Single,
-    /// `upstreams` at once; the first success answers.
-    Hedge { upstreams: usize },
-    /// `upstreams` at once; `threshold` matching answers answer.
-    Quorum { threshold: usize, upstreams: usize },
+    /// `fanout` upstreams at once; the first success answers.
+    Hedge { fanout: usize },
+    /// `fanout` upstreams at once; `threshold` matching answers answer.
+    Quorum { threshold: usize, fanout: usize },
     /// Subscriptions only: on every upstream, the first copy of each
     /// notification forwarded.
     Redundant,
 }
 
 impl Mode {
-    pub fn hedge(upstreams: usize) -> Self {
-        Mode::Hedge { upstreams }
+    pub fn hedge(fanout: usize) -> Self {
+        Mode::Hedge { fanout }
     }
-    pub fn quorum(threshold: usize, upstreams: usize) -> Self {
-        Mode::Quorum { threshold, upstreams }
+    pub fn quorum(threshold: usize, fanout: usize) -> Self {
+        Mode::Quorum { threshold, fanout }
     }
 }
 
@@ -441,23 +442,23 @@ impl<'de> Deserialize<'de> for Mode {
         #[serde(deny_unknown_fields)]
         struct Raw {
             r#type: String,
-            upstreams: Option<usize>,
+            fanout: Option<usize>,
             threshold: Option<usize>,
         }
         let raw = Raw::deserialize(d)?;
         let mode = match raw.r#type.as_str() {
             "single" => Mode::Single,
             "redundant" => Mode::Redundant,
-            "hedge" => Mode::Hedge { upstreams: raw.upstreams.ok_or_else(|| D::Error::missing_field("upstreams"))? },
+            "hedge" => Mode::Hedge { fanout: raw.fanout.ok_or_else(|| D::Error::missing_field("fanout"))? },
             "quorum" => Mode::Quorum {
                 threshold: raw.threshold.ok_or_else(|| D::Error::missing_field("threshold"))?,
-                upstreams: raw.upstreams.ok_or_else(|| D::Error::missing_field("upstreams"))?,
+                fanout: raw.fanout.ok_or_else(|| D::Error::missing_field("fanout"))?,
             },
             other => return Err(D::Error::unknown_variant(other, &["single", "hedge", "quorum", "redundant"])),
         };
         let stray = |field: &str| D::Error::custom(format!("`{field}` is not a field of mode type `{}`", raw.r#type));
-        if raw.upstreams.is_some() && matches!(mode, Mode::Single | Mode::Redundant) {
-            return Err(stray("upstreams"));
+        if raw.fanout.is_some() && matches!(mode, Mode::Single | Mode::Redundant) {
+            return Err(stray("fanout"));
         }
         if raw.threshold.is_some() && !matches!(mode, Mode::Quorum { .. }) {
             return Err(stray("threshold"));
@@ -639,15 +640,16 @@ mod tests {
         };
         let mode = |extra: &str| parse_toml(&route(extra), &|_| None).map(|c| c.routes["r"].mode.clone());
         assert_eq!(mode("mode = { type = \"single\" }").unwrap(), Some(Mode::Single));
-        assert_eq!(mode("mode = { type = \"hedge\", upstreams = 2 }").unwrap(), Some(Mode::hedge(2)));
-        assert_eq!(mode("mode = { type = \"quorum\", threshold = 2, upstreams = 3 }").unwrap(), Some(Mode::quorum(2, 3)));
+        assert_eq!(mode("mode = { type = \"hedge\", fanout = 2 }").unwrap(), Some(Mode::hedge(2)));
+        assert_eq!(mode("mode = { type = \"quorum\", threshold = 2, fanout = 3 }").unwrap(), Some(Mode::quorum(2, 3)));
         assert_eq!(mode("mode = { type = \"redundant\" }").unwrap(), Some(Mode::Redundant));
         for (extra, expected) in [
-            ("mode = { type = \"hedge\" }", "missing field `upstreams`"),
-            ("mode = { type = \"quorum\", upstreams = 3 }", "missing field `threshold`"),
-            ("mode = { type = \"single\", upstreams = 2 }", "`upstreams` is not a field of mode type `single`"),
-            ("mode = { type = \"hedge\", upstreams = 2, threshold = 1 }", "`threshold` is not a field of mode type `hedge`"),
-            ("mode = { type = \"redundant\", upstreams = 2 }", "`upstreams` is not a field of mode type `redundant`"),
+            ("mode = { type = \"hedge\" }", "missing field `fanout`"),
+            ("mode = { type = \"quorum\", fanout = 3 }", "missing field `threshold`"),
+            ("mode = { type = \"single\", fanout = 2 }", "`fanout` is not a field of mode type `single`"),
+            ("mode = { type = \"hedge\", fanout = 2, threshold = 1 }", "`threshold` is not a field of mode type `hedge`"),
+            ("mode = { type = \"redundant\", fanout = 2 }", "`fanout` is not a field of mode type `redundant`"),
+            ("mode = { type = \"hedge\", upstreams = 2 }", "unknown field `upstreams`, expected one of `type`, `fanout`, `threshold`"),
             ("mode = { type = \"retry\" }", "unknown variant `retry`, expected one of `single`, `hedge`, `quorum`, `redundant`"),
             ("mode = false", ""),
             // The old keys are gone; the error lists `mode` instead.

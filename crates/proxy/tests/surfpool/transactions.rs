@@ -8,7 +8,7 @@ use crate::harness::*;
 const ONE_SOL: u64 = 1_000_000_000;
 
 /// A route over every upstream; `policies` are its own lines, e.g.
-/// `mode = { type = "hedge", upstreams = 2 }`.
+/// `mode = { type = "hedge", fanout = 2 }`.
 fn route(name: &str, policies: &str) -> String {
     format!("[routes.{name}]\nupstreams = [\"*\"]\n{policies}\n[routes.{name}.methods]\n\"*\" = {{}}\n")
 }
@@ -52,7 +52,7 @@ async fn simulate_send_and_read_back_a_transfer() {
 #[ignore = "needs surfpool"]
 async fn a_hedged_send_reaches_both_nodes_and_lands_once() {
     // Two upstreams on one chain: the chain sees the same transaction twice.
-    let env = env(&[0, 0], &route("h", "mode = { type = \"hedge\", upstreams = 2 }")).await;
+    let env = env(&[0, 0], &route("h", "mode = { type = \"hedge\", fanout = 2 }")).await;
     let chain = env.chain(0);
     let wallet = chain.funded_wallet(2 * ONE_SOL).await;
     let to = pubkey();
@@ -69,7 +69,7 @@ async fn a_hedged_send_reaches_both_nodes_and_lands_once() {
 async fn a_hedged_send_succeeds_when_one_node_rejects_it() {
     // Separate chains: the sender has funds on chain 0 only, so chain 1
     // rejects the transaction while chain 0 accepts it.
-    let env = env(&[0, 1], &route("h", "mode = { type = \"hedge\", upstreams = 2 }")).await;
+    let env = env(&[0, 1], &route("h", "mode = { type = \"hedge\", fanout = 2 }")).await;
     let wallet = env.chain(0).funded_wallet(2 * ONE_SOL).await;
     let to = pubkey();
     let (tx, sig) = wallet.transfer(&to, 3_000_000, &env.chain(0).latest_blockhash().await);
@@ -108,7 +108,7 @@ async fn a_send_is_exempted_from_route_policies_with_its_own_entry() {
     // startup warning advises. Nothing is cached unless named.
     let env = env(
         &[0, 0],
-        "[routes.q]\nupstreams = [\"*\"]\nmode = { type = \"quorum\", threshold = 2, upstreams = 2 }\n\
+        "[routes.q]\nupstreams = [\"*\"]\nmode = { type = \"quorum\", threshold = 2, fanout = 2 }\n\
          [routes.q.methods]\n\"*\" = {}\nsendTransaction = { mode = { type = \"single\" } }\n",
     )
     .await;
